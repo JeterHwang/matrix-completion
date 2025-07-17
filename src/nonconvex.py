@@ -3,7 +3,10 @@ import numpy as np
 from tqdm import tqdm
 from torch.autograd import grad
 from torch.autograd.functional import hessian
-from utils import create_Z, sample_mask, spectral_initialization
+from src.utils import create_Z, sample_mask, spectral_initialization
+
+def loss_fn(L, R, mask, Z):
+    return torch.square(mask * (L @ R.T - Z)).sum() / 4
 
 @torch.no_grad()
 def project(X, coherence):
@@ -15,14 +18,11 @@ def project(X, coherence):
     scale_X = torch.maximum(row_norm_X, torch.ones_like(row_norm_X))
     X.div_(scale_X.unsqueeze(-1))
 
-def sgd(n, m, r, p, mu, loss_fn, PSD=False, projected=False, optim='SGD', iters=100, lr=0.001):
+def sgd(L, R, mask, Z, mu=None, projected=False, optim='SGD', iters=100, lr=0.001):
     # Initialization
-    Z, mu_Z = create_Z(n, m, r, mu, PSD)
-    mask = sample_mask(n, m, p)
-    L, R = spectral_initialization(p, r, Z, mask)
     criterion = loss_fn
     if optim == 'SGD':
-        optimizer = torch.optim.SGD([L, R], lr=lr, momentum=0.9)
+        optimizer = torch.optim.SGD([L, R], lr=lr)
     elif optim == 'Adam':
         optimizer = torch.optim.Adam([L, R], lr=lr, weight_decay=1e-4)
     else:
@@ -47,4 +47,4 @@ def sgd(n, m, r, p, mu, loss_fn, PSD=False, projected=False, optim='SGD', iters=
     grad_norm_L = torch.linalg.matrix_norm(grad(criterion(L, R, mask, Z), L)[0])
     min_eigenvalue_L = torch.linalg.eigvalsh(hessian(criterion, (L, R, mask, Z))[0][0].reshape(w_L,h_L,-1).reshape(w_L*h_L,-1))[0]
 
-    return L, R, Z, mu_Z, losses, torch.sum(mask).item(), torch.sum(((L @ R.T) - Z)**2).item(), grad_norm_L.item(), min_eigenvalue_L.item()
+    return losses, torch.sum(((L @ R.T) - Z)**2).item(), grad_norm_L.item(), min_eigenvalue_L.item()

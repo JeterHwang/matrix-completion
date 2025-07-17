@@ -1,6 +1,7 @@
 import torch
 import numpy as np
-from torch.linalg import qr, svd
+from numpy.linalg import qr
+from torch.linalg import svd
 
 def same_seed(seed):
     # set seeds
@@ -40,7 +41,14 @@ def incoherent_factor(n, r, mu):
 
     return U, actual_mu
 
-def create_Z(n, m, r, mu, PSD=False, convex=True):
+def augment_Z(X: np.ndarray):
+    n, m = X.shape
+    aug_X = np.zeros((n+m, n+m))
+    aug_X[n:, :n] = X.T
+    aug_X[:n, n:] = X
+    return aug_X
+
+def create_Z(n, m, r, mu, PSD=False):
     if PSD:
         assert n == m
         U, mu_U = incoherent_factor(n, r, mu)
@@ -51,13 +59,7 @@ def create_Z(n, m, r, mu, PSD=False, convex=True):
     s = np.linspace(1.0, 0.2, r) 
     Sigma = np.diag(s)
     X_star = U @ Sigma @ V.T
-    if convex:
-        Z = np.zeros((n+m, n+m))
-        Z[n:, :n] = X_star.T
-        Z[:n, n:] = X_star
-    else:
-        Z = X_star
-    return Z, max(mu_U, mu_V)
+    return X_star, max(mu_U, mu_V)
 
 # def create_Z(n, m, r, mu, PSD=False): # Nonconvex
 #     if PSD:
@@ -72,10 +74,8 @@ def create_Z(n, m, r, mu, PSD=False, convex=True):
 #     Z = U @ Sigma @ V.T
 #     return Z, max(mu_U, mu_V)
 
-def sample_mask(n, m, p, convex=True):
-    mask = np.random.binomial(1, p, (n, m))
-    if not convex: # Non-convex
-        return mask
+def augment_mask(mask: np.ndarray):
+    n, m = mask.shape
     indices = []
     for i in range(n):
         for j in range(m):
@@ -85,11 +85,15 @@ def sample_mask(n, m, p, convex=True):
     for i, (x, y) in enumerate(indices):
         A[i][x][y+n] = 1
         A[i][y+n][x] = 1
-    return mask, A
+    return A
+
+def sample_mask(n, m, p):
+    mask = np.random.binomial(1, p, (n, m))
+    return mask
 
 def spectral_initialization(p, r, Z, mask):
     Z_0 = Z * mask * (1 / p)
     U, S, Vh = svd(Z_0, full_matrices=False)
     L_0 = U[:,:r] @ torch.diag(torch.sqrt(S[:r]))
     R_0 = Vh[:r,:].T @ torch.diag(torch.sqrt(S[:r]))
-    return L_0.requires_grad_(True), R_0.requires_grad_(True)
+    return L_0, R_0
