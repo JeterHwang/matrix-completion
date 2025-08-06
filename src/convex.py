@@ -3,7 +3,7 @@ import numpy as np
 from src.utils import augment_mask, augment_Z
 
 def SDP(_Z: np.ndarray, mask: np.ndarray):
-    n, m = Z.shape
+    n, m = _Z.shape
     A = augment_mask(mask)
     Z = augment_Z(_Z)
     X = cp.Variable(Z.shape, symmetric=True)
@@ -23,4 +23,4 @@ def SDP(_Z: np.ndarray, mask: np.ndarray):
     W2 = X.value[n:, n:]
     X_star = X.value[:n, n:]
 
-    return W1, W2, X_star, np.sum((Z[:n, n:] - X_star)**2)
+    return W1, W2, X_star, np.linalg.norm(Z[:n, n:] - X_star, ord='fro')
