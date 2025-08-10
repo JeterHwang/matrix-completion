@@ -1,20 +1,58 @@
 import torch 
 import numpy as np
-from typing import List
+from typing import List, Dict
 from tqdm import tqdm
 from torch.autograd import grad
 from torch.autograd.functional import hessian
-from src.utils import incoherence_proj
+from src.utils import incoherence_proj, mag_ang_proj, create_mask
 
 def create_loss_fn(loss_type, **kwargs):
-    def MC_loss_fn(X_L: torch.Tensor, X_R: torch.Tensor, e: torch.Tensor = kwargs['e'], Z_L: torch.Tensor = kwargs['ZL'], Z_R: torch.Tensor = kwargs['ZR']):
-        return torch.square(kwargs['mask'] * (X_L @ X_R.T - Z_L @ Z_R.T + e)).sum() / 4
-    def MC_loss_fn_PSD(X: torch.Tensor, e: torch.Tensor = kwargs['e'], Z: torch.Tensor = kwargs['Z']):
-        return torch.square(kwargs['mask'] * (X @ X.T - Z @ Z.T + e)).sum() / 4
-    def PSSE_loss_fn(x: torch.Tensor, e: torch.Tensor = kwargs['e'], z: torch.Tensor = kwargs['Z']):
-        pred = (x.T.unsqueeze(0) @ kwargs['P'] @ x.unsqueeze(0))
-        gt = (z.T.unsqueeze(0) @ kwargs['P'] @ z.unsqueeze(0))
-        return (pred - gt + e).square().sum() / 2
+    _e = kwargs['e'] if 'e' in kwargs else 0
+    _P = kwargs['P'] if 'P' in kwargs else 0
+    _ZL = kwargs['ZL'] if 'ZL' in kwargs else 0
+    _ZR = kwargs['ZR'] if 'ZR' in kwargs else 0
+    _Z = kwargs['Z'] if 'Z' in kwargs else 0
+    _A = kwargs['A'] if 'A' in kwargs else 0
+    _k = kwargs['top_k'] if 'top_k' in kwargs else 100000000
+
+    def MC_loss_fn(
+        XL: torch.Tensor, 
+        XR: torch.Tensor, 
+        e: torch.Tensor = _e, 
+        ZL: torch.Tensor = _ZL, 
+        ZR: torch.Tensor = _ZR, 
+        P: torch.Tensor = _P,
+        k: int = _k             # Not optimized
+    ):
+        mask = create_mask(P, k)
+        return torch.square(((mask - P).detach() + P) * (X_L @ X_R.T - Z_L @ Z_R.T + e)).sum() / 4
+    
+    def MC_loss_fn_PSD(
+        X: torch.Tensor, 
+        e: torch.Tensor = _e, 
+        Z: torch.Tensor = _Z,
+        P: torch.Tensor = _P,
+        k: int = _k             # Not optimized
+    ):
+        mask = create_mask(P, k)
+        return torch.square(((mask - P).detach() + P) * (X @ X.T - Z @ Z.T + e)).sum() / 4
+    
+    def PSSE_loss_fn(
+        X: torch.Tensor, 
+        e: torch.Tensor = _e, 
+        Z: torch.Tensor = _Z,
+        P: torch.Tensor = _P,
+        k: int = _k,            # Not optimized
+        A: torch.Tensor = _A,   # Not optimized
+    ):
+        mask = create_mask(P, k)
+        pred = (X.T.unsqueeze(0) @ A @ X.unsqueeze(0)).squeeze()
+        gt = (Z.T.unsqueeze(0) @ A @ Z.unsqueeze(0)).squeeze()
+        masked = ((mask - P).detach() + P) * (pred - gt + e)
+        # print(pred-gt+e)
+        # print(masked)
+        # print(masked)
+        return masked.square().sum() / 2
     
     if loss_type == 'MC':
         return MC_loss_fn
@@ -29,9 +67,11 @@ def create_proj_fn(task, **kwargs):
     def MC_project(X):
         with torch.no_grad():
             incoherence_proj(X, kwargs['mu'])
-    def PSSE_project(x):
+    def PSSE_project(X):
         with torch.no_grad():
-            x[len(x) // 2] = 0
+            if len(X) % 2 == 0:
+                X[len(X) // 2] = 0
+            mag_ang_proj(X, 1.2, 0.8, 90, -90)
     if task == 'MC':
         return MC_project
     elif task == 'PSSE':
@@ -40,7 +80,7 @@ def create_proj_fn(task, **kwargs):
         raise NotImplementedError
 
 def sgd(
-    parameters: List[torch.Tensor], 
+    parameters: Dict[str, torch.Tensor], 
     criterion,
     project_fn,
     optim: str      = 'SGD', 
@@ -50,14 +90,13 @@ def sgd(
     lr_sched: str   = 'static',
     ret_eig: bool   = False,
 ):
-    assert len(parameters) in [1, 2]
     # Initialization
     if optim == 'SGD':
-        optimizer = torch.optim.SGD(parameters, lr=lr)
+        optimizer = torch.optim.SGD(list(parameters.values()), lr=lr)
     elif optim == 'Adam':
-        optimizer = torch.optim.Adam(parameters, lr=lr)
+        optimizer = torch.optim.Adam(list(parameters.values()), lr=lr)
     elif optim == 'AdamW':
-        optimizer = torch.optim.AdamW(parameters, lr=lr)
+        optimizer = torch.optim.AdamW(list(parameters.values()), lr=lr)
     else:
         raise NotImplementedError
     # SGD
@@ -65,7 +104,7 @@ def sgd(
     with tqdm(total=iters, leave=False) as pbar:
         for i in range(iters):
             optimizer.zero_grad()
-            loss = criterion(*parameters)
+            loss = criterion(**parameters)
             losses.append((loss.item()))
             loss.backward()
             optimizer.step()
@@ -81,15 +120,14 @@ def sgd(
                 param_group['lr'] = new_lr
             # Project to feasible set
             if project_fn is not None:
-                for param in parameters:
-                    project_fn(param)
+                project_fn(**parameters)
             pbar.update(1)
-            pbar.set_description(f"Iter: {i}, lr={new_lr:.6f}, loss={losses[-1]:.9f}")
+            pbar.set_description(f"lr={new_lr:.6f}, loss={losses[-1]:.9f}")
     
-    w_L, h_L = parameters[0].size() 
-    grad_norm_L = torch.linalg.matrix_norm(grad(criterion(*parameters), parameters[0])[0]).item()
+    w_L, h_L = parameters['X'].size() 
+    grad_norm_L = torch.linalg.matrix_norm(grad(criterion(**parameters), parameters['X'])[0]).item()
     if ret_eig:
-        min_eigenvalue_L = torch.linalg.eigvalsh(hessian(criterion, tuple(parameters))[0][0].reshape(w_L,h_L,-1).reshape(w_L*h_L,-1))[0].item()
+        min_eigenvalue_L = torch.linalg.eigvalsh(hessian(criterion, tuple(parameters.values()))[0][0].reshape(w_L,h_L,-1).reshape(w_L*h_L,-1))[0].item()
     else:
         min_eigenvalue_L = 0
 

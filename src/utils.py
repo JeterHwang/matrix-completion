@@ -3,6 +3,7 @@ import random
 import numpy as np
 from numpy.linalg import qr
 from torch.linalg import svd
+import scipy.io as sio
 import pandapower as pp
 import pandapower.networks as pn
 from scipy.sparse import csr_matrix
@@ -179,13 +180,40 @@ def extract_measurement():
         Matrices.append((Q_i.real, Q_i.imag, False))
     return Matrices, z
 
+def load_mat_data(path):
+    # --- 1.  Load the .mat file --------------------------------------------------
+    mat = sio.loadmat(
+        path,
+        squeeze_me=True,            # drop singleton dimensions
+        simplify_cells=True         # unwrap cell arrays / structs automatically
+    )                               # spmatrix=True by default, so sparse MATLAB
+                                    # variables come back as SciPy sparse objects:contentReference[oaicite:0]{index=0}
+
+    # --- 2.  Grab the variables you need -----------------------------------------
+    A   = mat["A"]      # sparse matrix
+    bsol   = np.asarray(mat["b"]).ravel()       # 1-D NumPy vector
+    xsol = np.asarray(mat["xsol"]).ravel()   # 1-D NumPy vector
+
+    # --- 3.  (Optional) tidy-up / conversions ------------------------------------
+    # Make sure A is the actual sparse matrix (not wrapped in a 1×1 object array)
+    if isinstance(A, np.ndarray) and A.dtype == object:
+        A = A.item()                # unwrap cell / struct entry:contentReference[oaicite:1]{index=1}
+
+    # Put A in the format you like:
+    A = A.tocsr()                   # fast mat-vecs; or .tocsc(), .toarray(), …
+
+    # If you really need dense NumPy arrays:
+    A_dense = A.toarray()           # beware of memory blow-up for large matrices
+
+    return A_dense
+
 def create_P(mats):
     P = []
     for p_r, p_i, real in mats:
         if real:
-            P.append(torch.tensor(np.concatenate([np.concatenate([p_r, -p_i], axis=1), np.concatenate([p_i, p_r], axis=1)], axis=0), dtype=torch.float64))
+            P.append(torch.tensor(np.concatenate([np.concatenate([p_r, -p_i[:,1:]], axis=1), np.concatenate([p_i[1:], p_r[1:,1:]], axis=1)], axis=0), dtype=torch.float64))
         else:
-            P.append(torch.tensor(np.concatenate([np.concatenate([p_i, p_r], axis=1), np.concatenate([-p_r, p_i], axis=1)], axis=0), dtype=torch.float64))
+            P.append(torch.tensor(np.concatenate([np.concatenate([p_i, p_r[:,1:]], axis=1), np.concatenate([-p_r[1:], p_i[1:,1:]], axis=1)], axis=0), dtype=torch.float64))
     random.shuffle(P) 
     return torch.stack(P) 
 
@@ -194,6 +222,7 @@ def PSSE_initialization(z, t):
     x_0 = z + t * gaussian_vector / np.linalg.norm(gaussian_vector, ord=np.inf)
     return x_0
 
+@torch.no_grad()
 def incoherence_proj(X, mu):
     n, r = X.size()
     # incoherence projection of X
@@ -202,6 +231,33 @@ def incoherence_proj(X, mu):
     row_norm_X.div_(frob_norm_X * np.sqrt(mu / n))
     scale_X = torch.maximum(row_norm_X, torch.ones_like(row_norm_X))
     X.div_(scale_X.unsqueeze(-1))
+
+@torch.no_grad()
+def mag_ang_proj(X, mag_high, mag_low, ang_high, ang_low):
+    assert len(X) % 2 != 0
+    n = (len(X) + 1) // 2
+    X_comp = torch.complex(X[:n], torch.cat([torch.zeros((1,1), dtype=X.dtype), X[n:]]))
+    # Magnitude projection
+    mag = torch.abs(X_comp)
+    scale_upper = torch.maximum(mag / mag_high, torch.ones_like(mag))
+    scale_lower = torch.minimum(mag / mag_low, torch.ones_like(mag))
+    new_mag = mag / (scale_upper * scale_lower)
+    # Angle projection
+    ang = torch.angle(X_comp)
+    diff_upper = torch.maximum(ang - ang_high / 180 * torch.pi, torch.zeros_like(ang))
+    diff_lower = torch.minimum(ang - ang_low / 180 * torch.pi, torch.zeros_like(ang))
+    new_ang = ang - 2 * (diff_upper + diff_lower)
+    new_X = torch.polar(new_mag, new_ang)
+    X[:n] = new_X.real
+    X[n:] = new_X.imag[1:]
+
+def create_mask(prob_mat: torch.Tensor, top_k: int):
+    flatten = prob_mat.view(-1)
+    _, indices = torch.topk(flatten, k=top_k)
+    mask = torch.zeros_like(flatten, dtype=prob_mat.dtype)
+    mask[indices] = 1
+    mask = mask.view(prob_mat.size())
+    return mask
 
 def calc_loss_coeff(alpha_0, beta_0, alpha_t, beta_t, i, iters, scale_type='linear'):
     if scale_type == 'static':
@@ -213,3 +269,53 @@ def calc_loss_coeff(alpha_0, beta_0, alpha_t, beta_t, i, iters, scale_type='line
         return alpha, beta
     else:
         raise NotImplementedError
+
+@torch.no_grad()
+def print_busses(title, parameters):
+    print(f"==================== {title} ====================")
+    if 'X' in parameters:
+        print("=> X")
+        X = parameters['X']
+        assert len(X) % 2 != 0
+        n = (len(X) + 1) // 2
+        X_comp = torch.complex(X[:n], torch.cat([torch.zeros((1,1), dtype=X.dtype), X[n:]])).squeeze()
+        mags = torch.abs(X_comp)
+        angs = torch.angle(X_comp) / torch.pi * 180
+        for i in range(len(X_comp)):
+            print(f"Bus-{i}: mag = {mags[i]:.4f}, ang = {angs[i]:.2f}")
+    if 'Z' in parameters:
+        print("=> Z")
+        Z = parameters['Z']
+        assert len(Z) % 2 != 0
+        n = (len(Z) + 1) // 2
+        Z_comp = torch.complex(Z[:n], torch.cat([torch.zeros((1,1), dtype=Z.dtype), Z[n:]])).squeeze()
+        mags = torch.abs(Z_comp)
+        angs = torch.angle(Z_comp) / torch.pi * 180
+        for i in range(len(Z_comp)):
+            print(f"Bus-{i}: mag = {mags[i]:.4f}, ang = {angs[i]:.2f}")
+    if 'P' in parameters:
+        print("=> P")
+        print(parameters['P'].data)
+    print("===================================================")
+
+@torch.no_grad()
+def print_counter_MC(title, top_k, parameters, losses, P=None):
+    print(f"==================== {title} ====================")
+    print(f"{'=> # of samples (m)':<27} {'=':^1} {top_k:>10}")
+    print(f"{'=> Total loss':<27} {'=':^1} {losses[-1][0]:>10.2e}")
+    print(f"{'=> f(Z) - f(X)':<27} {'=':^1} {losses[-1][1]:>10.2e}")
+    print(f"{'=> |gradient(X)|':<27} {'=':^1} {losses[-1][2]:>10.2e}")
+    print(f"{'=> -lambda_min(hessian(X))':<27} {'=':^1} {losses[-1][3]:>10.2e}")
+    print(f"{'=> |XX^T-ZZ^T|_F':<27} {'=':^1} {losses[-1][6]:>10.2e}")
+    print(f"{'=> X'} {'=':^1}")
+    print(parameters['X'].data)
+    if 'Z' in parameters:
+        print(f"{'=> Z'} {'=':^1}")
+        print(parameters['Z'].data)
+    P = (parameters['P'] if 'P' in parameters else P)
+    if P is not None:
+        print(f"{'=> P'} {'=':^1}")
+        print(P.data)
+        print(f"{'=> Mask'} {'=':^1}")
+        print(create_mask(P, top_k).to(torch.long).data)
+    print("===================================================")
