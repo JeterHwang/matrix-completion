@@ -1,10 +1,15 @@
 import torch
+import time
 import numpy as np
+import logging
 from typing import List, Dict
 from tqdm import tqdm
 from torch.autograd import grad
+from torch.func import jacrev
 from torch.autograd.functional import hessian
-from src.utils import incoherence_proj, mag_ang_proj, calc_loss_coeff
+from torch.linalg import eigh
+from src.utils import incoherence_proj, mag_ang_proj, calc_loss_coeff, emb2rect
+from src.eigen import lanczos, power_method, eigen_decomp
 
 def create_search_proj_fn(proj_type, **kwargs):
     @torch.no_grad()
@@ -22,9 +27,9 @@ def create_search_proj_fn(proj_type, **kwargs):
     @torch.no_grad()
     def PSSE_project(X, e=None, Z=None, **args):
         assert len(X) % 2 != 0
-        mag_ang_proj(X, 1.2, 0.8, 90, -90)
-        if Z is not None:
-            mag_ang_proj(Z, 1.2, 0.8, 90, -90)
+        # mag_ang_proj(X, 1.2, 0.8, 90, -90)
+        # if Z is not None:
+        #     mag_ang_proj(Z, 1.2, 0.8, 90, -90)
         if e is not None:
             norm_e = torch.linalg.vector_norm(e, ord=2)
             if norm_e > kwargs['max_norm']:
@@ -36,10 +41,15 @@ def create_search_proj_fn(proj_type, **kwargs):
     else:
         raise NotImplementedError
 
+
 def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
     _e = kwargs['e'] if 'e' in kwargs else 0
     _P = kwargs['P'] if 'P' in kwargs else 0
     _Z = kwargs['Z'] if 'Z' in kwargs else 0
+    _Vmin = kwargs['Vmin'] if 'Vmin' in kwargs else 0.7
+    _Vmax = kwargs['Vmax'] if 'Vmax' in kwargs else 1.3
+    _thmin = kwargs['thmin'] if 'thmin' in kwargs else -torch.pi / 2
+    _thmax = kwargs['thmax'] if 'thmax' in kwargs else torch.pi / 2
 
     def MC_loss_sum(X, Z=_Z, e=_e, P=_P, alpha=1, beta=1):
         assert X.size() == Z.size()
@@ -63,28 +73,57 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
             transform_loss,
             sum_loss
         )
-    def MC_loss_max(X, Z=_Z, e=_e, P=_P, alpha=1, beta=1): # Use MC-PSD-2
+    def MC_loss_max(
+        X, 
+        Z: torch.Tensor = _Z, 
+        e: torch.Tensor = _e, 
+        P: torch.Tensor = _P, 
+        alpha           = 1, 
+        beta            = 1,
+        tau             = 1,
+    ): 
         assert X.size() == Z.size()
+        f.__defaults__ = f.__defaults__[:-1] + (tau,)
         w, h = X.size()
-        f_Z = f(Z, e, Z, P)
-        f_X = f(X, e, Z, P)
+        time1 = time.time()
+        f_Z, _ = f(Z, e, Z, P, diff=False)
+        f_X, sq_loss, grad_X, hess_X = f(X, e, Z, P, diff=True)
+        time2 = time.time()
+        # print("gradient closed form: ", grad_X)
+        # print(f_X, sq_loss, grad_X, hess_X)
         diff_loss = f_Z - f_X 
         dist_loss = -torch.linalg.norm(X - Z)
-        first_order_loss_X = torch.linalg.matrix_norm(grad(f(X, e, Z, P), X, create_graph=True)[0])
-        second_order_loss_X = -torch.linalg.eigvalsh(hessian(f, (X, e, Z, P), create_graph=True)[0][0].reshape(w,h,-1).reshape(w*h,-1))[0]
-        transform_loss = -torch.linalg.matrix_norm(X @ X.T - Z @ Z.T, ord='fro')
+        # gradients = grad(f(X, e, Z, P), X, create_graph=True)
+        # hessians = hessian(f, (X, e, Z, P), create_graph=True)
+        # hessian_X = hessians[0][0].reshape(w,h,-1).reshape(w*h,-1)
+        # hessian_X = (hessian_X + hessian_X.T) / 2
+        first_order_loss_X = torch.linalg.norm(grad_X)
+        # second_order_loss_X = -torch.linalg.eigvalsh(hessian_X)[0]
+        time3 = time.time()
+        eigvals, eigvecs = eigh(hess_X)
+        second_order_loss_X = -eigvals[0]
+        time4 = time.time()
+        # eigen_decomp(f, X, e, Z, P) # torch.tensor([0.0], dtype=torch.float64) #
+        # print(second_order_loss_X)
+        
+        # transform_loss = -torch.linalg.matrix_norm(X @ X.T - Z @ Z.T, ord='fro')
+        
+        # print(f"Compute loss, grad, hess: {time2 - time1} (s)")
+        # print(f"Compute norm: {time3 - time2} (s)")
+        # print(f"Compute eigen decomposition: {time4 - time3}")
         max_loss = torch.maximum(first_order_loss_X, second_order_loss_X)
         return (
-            alpha * transform_loss + beta * max_loss, 
+            alpha * sq_loss + beta * max_loss, 
             diff_loss, 
             first_order_loss_X, 
             second_order_loss_X, 
             f_X, 
             f_Z, 
             dist_loss,
-            transform_loss,
+            sq_loss,
             max_loss
         )
+    
     def PSSE_loss_sum(X, e=_e, Z=_Z, P=_P, alpha=1, beta=1): # Use PSSE-1
         w, h = X.size()
         f_X = f(X, e, Z, P)
@@ -106,26 +145,56 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
             transform_loss,
             sum_loss
         )
-    def PSSE_loss_max(X, e=_e, Z=_Z, P=_P, alpha=1, beta=1): # Use PSSE-1
-        w, h = X.size()
-        f_X = f(X, e, Z, P)
-        f_Z = f(Z, e, Z, P)
+    def PSSE_loss_max(
+            X       : torch.Tensor, 
+            e       : torch.Tensor  = _e, 
+            Z       : torch.Tensor  = _Z, 
+            P       : torch.Tensor  = _P, 
+            alpha   : float         = 1,        # Not optimized
+            beta    : float         = 1,        # Not optimized
+            tau     : float         = 1,
+            Vmin    : float         = _Vmin,    # Not optimized
+            Vmax    : float         = _Vmax,    # Not optimized
+            thmin   : float         = _thmin,   # Not optimized
+            thmax   : float         = _thmax,   # Not optimized
+        ): # Use PSSE-1
+        f.__defaults__ = f.__defaults__[:-1] + (tau,)
+        X_rect = emb2rect(X, Vmin, Vmax, thmin, thmax)
+        Z_rect = emb2rect(Z, Vmin, Vmax, thmin, thmax)
+        w, h = X_rect.size()
+        #################
+        f_X = f(X_rect, e, Z_rect, P)
+        f_Z = f(Z_rect, e, Z_rect, P)
         diff_loss = f_Z - f_X
-        transform_loss = -torch.linalg.matrix_norm(X @ X.T - Z @ Z.T, ord='fro')
-        dist_loss = -torch.linalg.norm(X - Z)
-        first_order_loss = torch.linalg.norm(grad(f(X, e, Z, P), X, create_graph=True)[0])
-        second_order_loss = -torch.linalg.eigvalsh(hessian(f, (X, e, Z, P), create_graph=True)[0][0].reshape(w,h,-1).reshape(w*h,-1))[0]
-        max_loss = torch.maximum(first_order_loss, second_order_loss)
+        transform_loss = -torch.linalg.matrix_norm(X_rect @ X_rect.T - Z_rect @ Z_rect.T, ord='fro')
+        dist_loss = -torch.linalg.norm(X_rect - Z_rect)
+        ##################
+        gradients = grad(f(X_rect, e, Z_rect, P), [X_rect], create_graph=True)
+        # hessians = hessian(f, (X_rect, e, Z_rect, P), create_graph=True)
+        # hessian_X = hessians[0][0].reshape(w,h,-1).reshape(w*h,-1)
+        # hessian_X = (hessian_X + hessian_X.T) / 2
+        # hessian_Z = hessians[2][2].reshape(w,h,-1).reshape(w*h,-1)
+        # hessian_Z = (hessian_Z + hessian_Z.T) / 2
+        grad_X = torch.linalg.norm(gradients[0])
+        # grad_Z = torch.linalg.norm(gradients[1])
+        # eig_min_X = torch.nn.functional.softplus(-torch.linalg.eigvalsh(hessian_X)[0] / tau) * tau
+        eig_min_X = -lanczos(f, X_rect, e, Z_rect, P)
+        # eig_min_X = -torch.linalg.eigvalsh(hessian_X)[0]
+        # eig_min_Z = -torch.linalg.eigvalsh(hessian_Z)[0]
+        feasible_loss_X = torch.maximum(grad_X, eig_min_X)
+        # feasible_loss_X = tau * torch.log(torch.exp(grad_X / tau) + torch.exp(eig_min_X / tau))
+        # feasible_loss_Z = torch.maximum(grad_Z, eig_min_Z)
+        # feasible_loss = feasible_loss_X + feasible_loss_Z
         return (
-            alpha * transform_loss + beta * max_loss, 
+            alpha * transform_loss + beta * feasible_loss_X, 
             diff_loss, 
-            first_order_loss, 
-            second_order_loss,
+            grad_X, 
+            eig_min_X,
             f_X, 
             f_Z, 
             dist_loss,
             transform_loss,
-            max_loss
+            feasible_loss_X
         )
     
     if loss_type == 'MC_sum':
@@ -156,14 +225,21 @@ def search(
     # clip_grad: bool = False,
     # loss_scale: str = 'linear',
 ):
+    parameter_groups = []
+    for key, val in parameters.items():
+        parameter_groups.append({
+            'name': key,
+            'params': [val],
+            'lr': lr
+        })
     if optim == 'Adam':
-        optimizer_W = torch.optim.Adam(list(parameters.values()), lr=lr)
+        optimizer_W = torch.optim.Adam(parameter_groups, lr=lr)
         # optimizer_coeff = torch.optim.Adam([coeff], lr=0.025)
     elif optim == 'AdamW':
-        optimizer_W = torch.optim.AdamW(list(parameters.values()), lr=lr, weight_decay=1e-4)
+        optimizer_W = torch.optim.AdamW(parameter_groups, lr=lr)
         # optimizer_coeff = torch.optim.Adam([coeff], lr=0.025)
     elif optim == 'SGD':
-        optimizer_W = torch.optim.SGD(list(parameters.values()), lr=lr, momentum=0.9, weight_decay=1e-4)
+        optimizer_W = torch.optim.SGD(parameter_groups, lr=lr, momentum=0.9, weight_decay=1e-4)
         # optimizer_coeff = torch.optim.Adam([coeff], lr=0.025)
     else:
         raise NotImplementedError
@@ -172,7 +248,7 @@ def search(
     loss_0, diff_0, grad_X_0, hess_X_0, f_X_0, f_Z_0, dist_0, trans_0, max_loss_0 = criterion(**parameters)
     losses.append((loss_0.item(), diff_0.item(), grad_X_0.item(), hess_X_0.item(), f_X_0.item(), f_Z_0.item(), trans_0.item()))
     # T = torch.sum(coeff.detach())
-    alpha, beta = 1, 1
+    alpha, beta, tau = 1, 1, 1
     # SGD
     with tqdm(total=iters, leave=False) as pbar:
         for i in range(iters):
@@ -181,17 +257,26 @@ def search(
             # beta = abs(trans / max(grad_X, hess_X)) * beta
             # alpha = coeff.detach()[0]
             # beta = coeff.detach()[1]
-            loss, diff, grad_X, hess_X, f_X, f_Z, dist, trans, max_loss = criterion(**parameters, alpha=alpha, beta=beta)
+            time1 = time.time()
+            loss, diff, grad_X, hess_X, f_X, f_Z, dist, trans, max_loss = criterion(**parameters, alpha=alpha, beta=beta, tau=tau)
             # print(parameters, f_X.item(), f_Z.item(), trans.item(), grad_X.item(), hess_X.item(), max_loss.item())
-            inputs = [parameters['X'], parameters['Z']] if 'Z' in parameters else [parameters['X']]
-            gradients_1 = grad(outputs=trans, inputs=inputs, retain_graph=True, allow_unused=True)
-            gradients_2 = grad(outputs=max_loss, inputs=inputs, retain_graph=True, allow_unused=True)
+            time2 = time.time()
+            # inputs = [parameters['X'], parameters['Z']] if 'Z' in parameters else [parameters['X']]
+            # gradients_1 = grad(outputs=trans, inputs=inputs, retain_graph=True, allow_unused=True)
+            # gradients_2 = grad(outputs=max_loss, inputs=inputs, retain_graph=True, allow_unused=True)
             optimizer_W.zero_grad()
+            time3 = time.time()
             loss.backward()
+            time4 = time.time()
+            # print(f"forward pass: {time2 - time1} (s)")
+            # print(f"Compute gradients: {time3 - time2} (s)")
+            # print(f"backward pass: {time4 - time3} (s)")
             # if clip_grad:
             #     torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0, norm_type=2)
-            grad_norm_1 = torch.sqrt(sum([0 if GG is None else torch.linalg.norm(GG).square() for GG in gradients_1]))
-            grad_norm_2 = torch.sqrt(sum([0 if GG is None else torch.linalg.norm(GG).square() for GG in gradients_2]))
+            
+            # grad_norm_1 = torch.sqrt(sum([0 if GG is None else torch.linalg.norm(GG).square() for GG in gradients_1]))
+            # grad_norm_2 = torch.sqrt(sum([0 if GG is None else torch.linalg.norm(GG).square() for GG in gradients_2]))
+            
             # if i % 1000 == 0:
             #     print(grad_norm_1, grad_norm_2)
             # g2 = coeff[1] * grad_norm_2.detach()  
@@ -199,12 +284,15 @@ def search(
             # print(grad_norm_1.item(), grad_norm_2.item())
             # g1 = grad_norm_2.item() / (grad_norm_1.item() + grad_norm_2.item())
             # g2 = grad_norm_1.item() / (grad_norm_1.item() + grad_norm_2.item())
-            r1 = (trans.item() - trans_0.item()) / (trans_bound[0] - trans_0.item())
-            r2 = (max_loss_0.item() - max_loss.item()) / max_loss_0.item()
-            alpha = grad_norm_2.item() * (np.exp(r1 * T) / (np.exp(r1 * T) + np.exp(r2 * T)))
-            beta = grad_norm_1.item() * (np.exp(r2 * T) / (np.exp(r1 * T) + np.exp(r2 * T)))
-            # alpha = 0.01
-            # beta = 10
+            
+            # boost = 0.5 * (1 + 3) + 0.5 * (3 - 1) * np.cos(np.pi * i / iters)
+            # r1 = (trans.item() - trans_0.item()) / (trans_bound[0] - trans_0.item())
+            # r2 = (max_loss_0.item() - max_loss.item()) / max_loss_0.item() * boost
+            # alpha = min(grad_norm_2.item() / grad_norm_1.item(), 50) * (np.exp(r1 * T) / (np.exp(r1 * T) + np.exp(r2 * T)))
+            # beta =  (np.exp(r2 * T) / (np.exp(r1 * T) + np.exp(r2 * T)))
+            tau = 0.5 * (0.5 + 0.05) + 0.5 * (0.5 - 0.05) * np.cos(np.pi * i / iters)
+            alpha = 0.01
+            beta = 100
             # r1 = trans.item() / trans_0          # f1_init cached at step 0
             # r2 = max_loss.item() / max_loss_0
             # r_bar = 0.5 * (r1 + r2)
@@ -230,18 +318,23 @@ def search(
             else:
                 raise NotImplementedError
             for param_group in optimizer_W.param_groups:
-                param_group['lr'] = new_lr
+                if param_group['name'] == 'X':
+                    param_group['lr'] = new_lr
+                elif param_group['name'] == 'P':
+                    param_group['lr'] = new_lr
+                else:
+                    param_group['lr'] = new_lr * 0.3
             # Project to feasible set
             project_fn(**parameters)
             # Evaluating
             losses.append((loss.item(), diff.item(), grad_X.item(), hess_X.item(), f_X.item(), f_Z.item(), trans.item()))
             # Early Stop
             if trans > trans_bound[0]:
-                print("transform loss too small !!")
+                logging.warning("transform loss too small !!")
                 break
             elif trans < trans_bound[1]:
-                print("transform loss explodes !!")
+                logging.warning("transform loss explodes !!")
                 break
-            pbar.set_description(f"lr={new_lr:.6f}, diff={diff.item():.2f}, dist={dist.item():.2f}, trans={trans.item():.2f}, max={max(grad_X.item(), hess_X.item()):.2f}, coeff=({alpha:.2f},{beta:.2f})")
+            pbar.set_description(f"lr={new_lr:.6f}, diff={diff.item():.2f}, dist={dist.item():.2f}, trans={trans.item():.4f}, grad={grad_X.item():.4f}, hess={hess_X.item():.4f}, coeff=({alpha:.2f},{beta:.2f})")
             pbar.update(1)
     return losses

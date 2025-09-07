@@ -7,7 +7,12 @@ import scipy.io as sio
 import pandapower as pp
 import pandapower.networks as pn
 from scipy.sparse import csr_matrix
+from scipy import sparse
 import networkx as nx
+from entmax import entmax15
+import logging
+import time
+from torch_sparse import transpose, spspmm
 
 def same_seed(seed):
     # set seeds
@@ -211,9 +216,9 @@ def create_P(mats):
     P = []
     for p_r, p_i, real in mats:
         if real:
-            P.append(torch.tensor(np.concatenate([np.concatenate([p_r, -p_i[:,1:]], axis=1), np.concatenate([p_i[1:], p_r[1:,1:]], axis=1)], axis=0), dtype=torch.float64))
+            P.append(torch.tensor(np.concatenate([np.concatenate([p_r, -p_i[:,1:]], axis=1), np.concatenate([p_i[1:], p_r[1:,1:]], axis=1)], axis=0)))
         else:
-            P.append(torch.tensor(np.concatenate([np.concatenate([p_i, p_r[:,1:]], axis=1), np.concatenate([-p_r[1:], p_i[1:,1:]], axis=1)], axis=0), dtype=torch.float64))
+            P.append(torch.tensor(np.concatenate([np.concatenate([p_i, p_r[:,1:]], axis=1), np.concatenate([-p_r[1:], p_i[1:,1:]], axis=1)], axis=0)))
     random.shuffle(P) 
     return torch.stack(P) 
 
@@ -251,13 +256,160 @@ def mag_ang_proj(X, mag_high, mag_low, ang_high, ang_low):
     X[:n] = new_X.real
     X[n:] = new_X.imag[1:]
 
-def create_mask(prob_mat: torch.Tensor, top_k: int):
-    flatten = prob_mat.view(-1)
-    _, indices = torch.topk(flatten, k=top_k)
-    mask = torch.zeros_like(flatten, dtype=prob_mat.dtype)
-    mask[indices] = 1
-    mask = mask.view(prob_mat.size())
+def emb2rect(X: torch.Tensor, Vmin, Vmax, thmin, thmax):
+    assert len(X) % 2 != 0
+    n = (len(X) + 1) // 2
+    mag = Vmin + (Vmax - Vmin) * torch.sigmoid(X[:n])
+    # ang = 0.5 * (thmin + thmax) + 0.5 * (thmax - thmin) * torch.tanh(X[n:])
+    ang = thmin + (thmax - thmin) * torch.sigmoid(X[n:])
+    rect = torch.cat([mag[:1], mag[1:] * torch.cos(ang), mag[1:] * torch.sin(ang)], dim=0)
+    return rect
+
+def emb2polar(X: torch.Tensor, Vmin, Vmax, thmin, thmax):
+    assert len(X) % 2 != 0
+    n = (len(X) + 1) // 2
+    mag = Vmin + (Vmax - Vmin) * torch.sigmoid(X[:n])
+    # ang = 0.5 * (thmin + thmax) + 0.5 * (thmax - thmin) * torch.tanh(X[n:])
+    ang = thmin + (thmax - thmin) * torch.sigmoid(X[n:])
+    return torch.cat([mag, ang], dim=0)
+
+def polar2emb(X: torch.Tensor, Vmin, Vmax, thmin, thmax):
+    assert len(X) % 2 != 0
+    n = (len(X) + 1) // 2
+    V_emb = -torch.log((Vmax - Vmin) * torch.reciprocal(X[:n] - Vmin) - 1)
+    ang_emb = -torch.log((thmax - thmin) * torch.reciprocal(X[n:] - thmin) - 1)
+    return torch.cat([V_emb, ang_emb], dim=0)
+
+def rect2emb(X: torch.Tensor, Vmin, Vmax, thmin, thmax):
+    assert len(X) % 2 != 0
+    n = (len(X) + 1) // 2
+    real = X[:n]
+    imag = torch.cat([torch.zeros_like(X)[0:1], X[n:]], dim=0)
+    polar = torch.complex(real, imag)
+    mag = torch.abs(polar)
+    ang = torch.angle(polar)
+    V_emb = -torch.log((Vmax - Vmin) * torch.reciprocal(mag - Vmin) - 1)
+    ang_emb = -torch.log((thmax - thmin) * torch.reciprocal(ang[1:] - thmin) - 1)
+    return torch.cat([V_emb, ang_emb], dim=0)
+
+def create_mask(
+    prob_mat: torch.Tensor,     # COO
+    top_k   : int,
+    M_type  : str,
+    M       : torch.Tensor,     # COO
+):
+    if top_k <= 0:
+        return M
+    flatten = prob_mat - M * 1e9
+    # if M_type == 'entmax':
+    #     if train:
+    #         mask = flatten
+    #     else:
+    #         _, indices = torch.topk(flatten, k=top_k)
+    #         mask = torch.zeros_like(flatten, dtype=prob_mat.dtype)
+    #         mask[indices] = 1
+    if M_type == 'STE':
+        _, idx = torch.topk(flatten.values(), k=top_k)
+        mask_val = torch.ones(len(idx), dtype=torch.float64)
+        mask_idx = flatten.indices()[:,idx]
+    else:
+        raise NotImplementedError
+    mask = torch.sparse_coo_tensor(torch.cat([mask_idx, M.indices()], dim=1), torch.cat([mask_val, M.values()]), (M.size(0), M.size(1))).coalesce()
     return mask
+
+def extend_mask_coo(
+    M: torch.Tensor,            # COO 
+    A: torch.Tensor = None,
+):
+    if A is not None: # A matrix for PSSE (TODO)
+        masked_A = A.reshape((A.size(0), -1)) * M
+        return masked_A.to_sparse_coo()
+    else:
+        n, m = M.size()
+        inds = M.indices()
+        vals = M.values()
+        flat_inds = inds[0] * m + inds[1]
+        return torch.sparse_coo_tensor(torch.stack([flat_inds, flat_inds]), vals, (n*m, n*m)).coalesce()
+        
+def symbasis(n: int) -> torch.Tensor:
+    """
+    Return V \in R^{(n^2) x (n(n+1)/2)} whose columns form an orthonormal basis
+    for the space of n×n symmetric matrices under the Frobenius inner product.
+
+    Vectorization matches MATLAB's vec(.) (column-major / Fortran order).
+    """
+    ndof = n * (n + 1) // 2
+
+    # Enumerate lower-triangular indices (i >= j) in column-major order (match MATLAB)
+    rows = torch.cat([torch.arange(j, n, dtype=torch.long) for j in range(n)])
+    cols = torch.cat([torch.full((n - j,), j, dtype=torch.long) for j in range(n)])
+
+    # Linear indices for vec(.) in column-major order
+    ii1 = rows + cols * n          # positions (i, j)
+    ii2 = cols + rows * n          # positions (j, i)
+
+    dof = torch.arange(ndof, dtype=torch.long)
+
+    # Values: sqrt(1/2) off-diagonals, and two 0.5 entries on diagonal (which sum to 1)
+    w1 = torch.full((ndof,), np.sqrt(0.5), dtype=torch.float64)
+    w2 = torch.full((ndof,), np.sqrt(0.5), dtype=torch.float64)
+    diag = (rows == cols)
+    w1[diag] = 0.5
+    w2[diag] = 0.5
+
+    values = torch.cat([w1, w2])
+    row_idx = torch.cat([ii1, ii2])
+    col_idx = torch.cat([dof, dof])
+    indices = torch.stack([row_idx, col_idx])
+
+    time1 = time.time()
+    # V = torch.sparse_coo_tensor(indices, values, (n*n, ndof))
+    indices_T, values_T = transpose(indices, values, n*n, ndof)
+    phi_phi_T_idx, phi_phi_T_val = spspmm(indices, values, indices_T, values_T, n*n, ndof, n*n)
+    time2 = time.time()
+    # print("Create Symbasis: ", time2 - time1)
+    return torch.sparse_coo_tensor(phi_phi_T_idx, phi_phi_T_val, (n*n, n*n)).coalesce()
+
+
+def kron_X_I(X, dim):
+    row_idx = torch.stack([torch.arange(X.size(0)*dim) for _ in range(X.size(1))]).T
+    col_idx_1 = torch.arange(dim).reshape((dim, 1)) + torch.arange(X.size(1)).reshape((1, X.size(1))) * dim
+    col_idx = torch.cat([col_idx_1 for _ in range(X.size(0))])
+    values = torch.cat([X for _ in range(dim)], dim=1).reshape(-1)
+    indices = torch.stack([row_idx.reshape(-1), col_idx.reshape(-1)])
+    # print(indices, values)
+    # dense = torch.kron(X.contiguous(), torch.eye(dim))
+    # return dense.to_sparse_coo()
+    return indices, values
+    # return torch.sparse_coo_tensor(indices, values, (X.size(0)*dim, X.size(1)*dim)).coalesce()
+
+def kron_I_X(X, dim):
+    row_idx = torch.stack([torch.arange(X.size(0) * dim) for _ in range(X.size(1))]).T
+    col_idx_1 = torch.cat([torch.arange(X.size(1)) for _ in range(X.size(0))])
+    col_idx = torch.arange(dim).reshape((dim, 1)) * X.size(1) + col_idx_1.reshape((1, -1)) 
+    values = torch.cat([X for _ in range(dim)], dim=0).reshape(-1)
+    indices = torch.stack([row_idx.reshape(-1), col_idx.reshape(-1)])
+    # dense = torch.kron(torch.eye(dim), X.contiguous())
+    # return dense.to_sparse_coo()
+    return indices, values
+    # return torch.sparse_coo_tensor(indices, values, (X.size(0)*dim, X.size(1)*dim)).coalesce()
+
+
+def logits2prob(
+    logits: torch.Tensor,
+    M_type: str,
+    tau: float = 0.5
+):
+    # flatten = logits.view(-1)
+    # if M_type == 'entmax':
+    #     prob_mat = top_k * entmax15(flatten, dim=0)
+    if M_type == 'STE':
+        prob_mat_idx = torch.stack([torch.arange(len(logits)), torch.arange(len(logits))])
+        prob_mat_val = torch.softmax(logits / tau, dim=0)
+        prob_mat = torch.sparse_coo_tensor(prob_mat_idx, prob_mat_val, (len(logits), len(logits))).coalesce()
+    else:
+        raise NotImplementedError
+    return prob_mat
 
 def calc_loss_coeff(alpha_0, beta_0, alpha_t, beta_t, i, iters, scale_type='linear'):
     if scale_type == 'static':
@@ -271,51 +423,69 @@ def calc_loss_coeff(alpha_0, beta_0, alpha_t, beta_t, i, iters, scale_type='line
         raise NotImplementedError
 
 @torch.no_grad()
-def print_busses(title, parameters):
-    print(f"==================== {title} ====================")
+def print_busses(title, parameters, constraints, top_k, M=None, M_type='STE'):
+    logging.info(f"==================== {title} ====================")
     if 'X' in parameters:
-        print("=> X")
-        X = parameters['X']
-        assert len(X) % 2 != 0
-        n = (len(X) + 1) // 2
-        X_comp = torch.complex(X[:n], torch.cat([torch.zeros((1,1), dtype=X.dtype), X[n:]])).squeeze()
-        mags = torch.abs(X_comp)
-        angs = torch.angle(X_comp) / torch.pi * 180
-        for i in range(len(X_comp)):
-            print(f"Bus-{i}: mag = {mags[i]:.4f}, ang = {angs[i]:.2f}")
+        logging.info("=> X")
+        n = (len(parameters['X']) + 1) // 2
+        X_polar = emb2polar(parameters['X'], *constraints)
+        X_mag, X_ang = X_polar[:n], X_polar[n:] / torch.pi * 180
+        for i in range(len(X_mag)):
+            if i == 0:
+                logging.info(f"Bus-{i}: mag = {X_mag[i].item():.4f}, ang = {0:.2f}")
+            else:
+                logging.info(f"Bus-{i}: mag = {X_mag[i].item():.4f}, ang = {X_ang[i-1].item():.2f}")
     if 'Z' in parameters:
-        print("=> Z")
-        Z = parameters['Z']
-        assert len(Z) % 2 != 0
-        n = (len(Z) + 1) // 2
-        Z_comp = torch.complex(Z[:n], torch.cat([torch.zeros((1,1), dtype=Z.dtype), Z[n:]])).squeeze()
-        mags = torch.abs(Z_comp)
-        angs = torch.angle(Z_comp) / torch.pi * 180
-        for i in range(len(Z_comp)):
-            print(f"Bus-{i}: mag = {mags[i]:.4f}, ang = {angs[i]:.2f}")
+        logging.info("=> Z")
+        n = (len(parameters['Z']) + 1) // 2
+        Z_polar = emb2polar(parameters['Z'], *constraints)
+        Z_mag, Z_ang = Z_polar[:n], Z_polar[n:] / torch.pi * 180
+        for i in range(len(Z_mag)):
+            if i == 0:
+                logging.info(f"Bus-{i}: mag = {Z_mag[i].item():.4f}, ang = {0:.2f}")
+            else:
+                logging.info(f"Bus-{i}: mag = {Z_mag[i].item():.4f}, ang = {Z_ang[i-1].item():.2f}")
     if 'P' in parameters:
-        print("=> P")
-        print(parameters['P'].data)
-    print("===================================================")
+        P = parameters['P']
+        logging.info(f"{'=> P'} {'=':^1}")
+        logging.info(P.data)
+        logging.info(f"{'=> Probability Matrix'} {'=':^1}")
+        logging.info(logits2prob(P, top_k, M_type, M).data)
+        logging.info(f"{'=> Mask'} {'=':^1}")
+        logging.info(create_mask(P, top_k, False, 'STE', M).to(torch.long).data)
+    else:
+        logging.info(f"{'=> Mask'} {'=':^1}")
+        logging.info(M.data)
+    logging.info("===================================================")
 
 @torch.no_grad()
-def print_counter_MC(title, top_k, parameters, losses, P=None):
-    print(f"==================== {title} ====================")
-    print(f"{'=> # of samples (m)':<27} {'=':^1} {top_k:>10}")
-    print(f"{'=> Total loss':<27} {'=':^1} {losses[-1][0]:>10.2e}")
-    print(f"{'=> f(Z) - f(X)':<27} {'=':^1} {losses[-1][1]:>10.2e}")
-    print(f"{'=> |gradient(X)|':<27} {'=':^1} {losses[-1][2]:>10.2e}")
-    print(f"{'=> -lambda_min(hessian(X))':<27} {'=':^1} {losses[-1][3]:>10.2e}")
-    print(f"{'=> |XX^T-ZZ^T|_F':<27} {'=':^1} {losses[-1][6]:>10.2e}")
-    print(f"{'=> X'} {'=':^1}")
-    print(parameters['X'].data)
+def print_counter_MC(title, top_k, parameters, losses, M=None, M_type='STE'):
+    logging.info(f"==================== {title} ====================")
+    logging.info(f"{'=> # of samples (m)':<27} {'=':^1} {top_k:>10}")
+    logging.info(f"{'=> Total loss':<27} {'=':^1} {losses[-1][0]:>10.2e}")
+    logging.info(f"{'=> f(Z) - f(X)':<27} {'=':^1} {losses[-1][1]:>10.2e}")
+    logging.info(f"{'=> |gradient(X)|':<27} {'=':^1} {losses[-1][2]:>10.2e}")
+    logging.info(f"{'=> -lambda_min(hessian(X))':<27} {'=':^1} {losses[-1][3]:>10.2e}")
+    logging.info(f"{'=> |XX^T-ZZ^T|_F':<27} {'=':^1} {losses[-1][6]:>10.2e}")
+    logging.info(f"{'=> X'} {'=':^1}")
+    logging.info(parameters['X'].data)
     if 'Z' in parameters:
-        print(f"{'=> Z'} {'=':^1}")
-        print(parameters['Z'].data)
-    P = (parameters['P'] if 'P' in parameters else P)
-    if P is not None:
-        print(f"{'=> P'} {'=':^1}")
-        print(P.data)
-        print(f"{'=> Mask'} {'=':^1}")
-        print(create_mask(P, top_k).to(torch.long).data)
-    print("===================================================")
+        logging.info(f"{'=> Z'} {'=':^1}")
+        logging.info(parameters['Z'].data)
+    if 'P' in parameters:
+        P = parameters['P']
+        logging.info(f"{'=> P'} {'=':^1}")
+        logging.info(P.data)
+        logging.info(f"{'=> Probability Matrix'} {'=':^1}")
+        logging.info(logits2prob(P, top_k, M_type, M).data)
+        logging.info(f"{'=> Mask'} {'=':^1}")
+        logging.info(create_mask(P, top_k, False, 'STE', M).to(torch.long).data)
+    else:
+        logging.info(f"{'=> Mask'} {'=':^1}")
+        logging.info(M.data)
+    logging.info("===================================================")
+
+if __name__ == '__main__':
+    V = torch.randn((2, 3))
+    print(V)
+    print(kron_I_X(V, 2).to_dense())

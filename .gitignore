@@ -3,6 +3,7 @@
 # data/
 dataset/
 __pycache__/
+plot/
 figures/
 fig/
 logs/
