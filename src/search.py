@@ -352,24 +352,27 @@ def compute_X_Z_e(
     parameters = {}
     for name, val  in variables.items():
         if name == 'X':
-            X = torch.normal(mean=0.0, std=torch.ones((n, r))).to(torch.float64).to(device).requires_grad_()
+            X = torch.normal(mean=0.0, std=torch.ones((n, r))).to(device).requires_grad_()
             parameters['X'] = X
         elif name == 'Z':
             if val is None:
-                Z = torch.normal(mean=0.0, std=torch.ones((n, r))).to(torch.float64).to(device).requires_grad_()
+                Z = torch.normal(mean=0.0, std=torch.ones((n, r))).to(device).requires_grad_()
                 parameters['Z'] = Z
             else:
                 Z = val.to(device)
         elif name == 'e':
             if val is None:
-                e = torch.zeros((n, n), requires_grad=True, dtype=torch.float64, device=device)
+                e = torch.zeros((n, n), requires_grad=True, device=device)
                 parameters['e'] = e
             else:
                 e = val.to(device)
         elif name == 'M':
-            M = val.to(device)
+            Ps = symbasis(n)
+            M = val
+            Ps_AT = torch.sparse.mm(Ps, M.T)
+            Ps, M, Ps_AT = Ps.to(device), M.to(device), Ps_AT.to(device)
     # check whether we need to train the mask
-    P = torch.rand(n*n, dtype=torch.float64, device=device)
+    P = torch.rand(n*n, device=device)
     if top_k > 0:
         P.requires_grad_()
         parameters['P'] = P
@@ -381,8 +384,9 @@ def compute_X_Z_e(
         e       = e.detach(),
         top_k   = top_k,
         M_type  = M_type,
-        M       = M.detach(),
-        sym     = symbasis(n).to(device),
+        M       = M,
+        sym     = Ps,
+        Ps_AT   = Ps_AT,
         diff    = True
     )
     criterion = create_search_loss_fn(
@@ -436,17 +440,17 @@ def search_counter(
     parameters = {}
     for name, val  in variables.items():
         if name == 'X':
-            X = torch.normal(0.0, 3.0 * torch.ones((n, 1))).to(torch.float64).requires_grad_()
+            X = torch.normal(0.0, 3.0 * torch.ones((n, 1))).requires_grad_()
             parameters['X'] = X
         elif name == 'Z':
             if val is None:
-                Z = torch.normal(0.0, 3.0 * torch.ones((n, 1))).to(torch.float64).requires_grad_()
+                Z = torch.normal(0.0, 3.0 * torch.ones((n, 1))).requires_grad_()
                 parameters['Z'] = Z
             else:
                 Z = val
         elif name == 'e':
             if val is None:
-                e = torch.zeros(len(A), requires_grad=True, dtype=torch.float64)
+                e = torch.zeros(len(A), requires_grad=True)
                 parameters['e'] = e
             else:
                 e = val

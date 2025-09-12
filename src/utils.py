@@ -310,7 +310,7 @@ def create_mask(
     #         mask[indices] = 1
     if M_type == 'STE':
         _, idx = torch.topk(flatten.values(), k=top_k)
-        mask_val = torch.ones(len(idx), dtype=torch.float64)
+        mask_val = torch.ones(len(idx))
         mask_idx = flatten.indices()[:,idx]
     else:
         raise NotImplementedError
@@ -351,8 +351,8 @@ def symbasis(n: int) -> torch.Tensor:
     dof = torch.arange(ndof, dtype=torch.long)
 
     # Values: sqrt(1/2) off-diagonals, and two 0.5 entries on diagonal (which sum to 1)
-    w1 = torch.full((ndof,), np.sqrt(0.5), dtype=torch.float64)
-    w2 = torch.full((ndof,), np.sqrt(0.5), dtype=torch.float64)
+    w1 = torch.full((ndof,), np.sqrt(0.5))
+    w2 = torch.full((ndof,), np.sqrt(0.5))
     diag = (rows == cols)
     w1[diag] = 0.5
     w2[diag] = 0.5

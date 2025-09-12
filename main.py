@@ -67,12 +67,12 @@ def main():
     if args.task == 'MC':
         M = torch.sparse_coo_tensor(
             torch.tensor([[],[]]), 
-            torch.tensor([], dtype=torch.float64), 
+            torch.tensor([]), 
             (args.n * args.n, args.n * args.n)
         )
         if not args.search_P:
             M = create_mask(
-                logits2prob(torch.rand((args.n * args.n), dtype=torch.float64), 'STE'),
+                logits2prob(torch.rand((args.n * args.n)), 'STE'),
                 top_k, 
                 'STE', 
                 M
@@ -102,7 +102,7 @@ def main():
         if args.busses == 2:
             A_np = load_mat_data("data/2bus/2bus_data.mat")
             n = 2 * args.busses - 1
-            A = torch.tensor(np.moveaxis(A_np.reshape(n,n,10), -1, 0), dtype=torch.float64).reshape((10, -1)).to_sparse_coo()
+            A = torch.tensor(np.moveaxis(A_np.reshape(n,n,10), -1, 0)).reshape((10, -1)).to_sparse_coo()
         else:
             raise NotImplementedError
         d = A.size(0)
@@ -110,12 +110,12 @@ def main():
         # Always pick the first n power flow measurements
         M = torch.sparse_coo_tensor(
             torch.stack([torch.arange(n), torch.arange(n)], dim=0),
-            torch.ones(n, dtype=torch.float64), 
+            torch.ones(n), 
             (d, d)
         )
         if not args.search_P:
             M = create_mask(
-                logits2prob(torch.rand((d), dtype=torch.float64), 'STE'),
+                logits2prob(torch.rand((d)), 'STE'),
                 top_k, 
                 'STE', 
                 M

@@ -25,16 +25,17 @@ def create_loss_fn(loss_type, **kwargs):
     _M_type = kwargs['M_type'] if 'M_type' in kwargs else 'STE'
     _M      = kwargs['M'] if 'M' in kwargs else 0
     _sym    = kwargs['sym'] if 'sym' in kwargs else 0
+    _Ps_AT  = kwargs['Ps_AT'] if 'Ps_AT' in kwargs else 0
     _diff   = kwargs['diff'] if 'diff' in kwargs else False
     
-    if _A is not None: # PSSE
-        MA_idx, MA_val = spspmm(_M.indices(), _M.values(), _A.indices(), _A.values(), _M.size(0), _M.size(1), _A.size(1)) # torch.sparse.mm(_M, _A)
-        MAT_idx, MAT_val = transpose(MA_idx, MA_val, _M.size(0), _A.size(1))
-        _Ps_AT_idx, _Ps_AT_val = spspmm(_sym.indices(), _sym.values(), MAT_idx, MAT_val, _sym.size(0), _sym.size(1), _M.size(0))
-        # Ps_AT = torch.sparse.mm(_sym, MA.T)
-    else:
-        MT_idx, MT_val = transpose(_M.indices(), _M.values(), _M.size(0), _M.size(1))
-        _Ps_AT_idx, _Ps_AT_val = spspmm(_sym.indices(), _sym.values(), MT_idx, MT_val, _sym.size(0), _sym.size(1), _M.size(0))
+    # if _A is not None: # PSSE
+    #     MA_idx, MA_val = spspmm(_M.indices(), _M.values(), _A.indices(), _A.values(), _M.size(0), _M.size(1), _A.size(1)) # torch.sparse.mm(_M, _A)
+    #     MAT_idx, MAT_val = transpose(MA_idx, MA_val, _M.size(0), _A.size(1))
+    #     _Ps_AT_idx, _Ps_AT_val = spspmm(_sym.indices(), _sym.values(), MAT_idx, MAT_val, _sym.size(0), _sym.size(1), _M.size(0))
+    #     # Ps_AT = torch.sparse.mm(_sym, MA.T)
+    # else:
+    #     MT_idx, MT_val = transpose(_M.indices(), _M.values(), _M.size(0), _M.size(1))
+    #     _Ps_AT_idx, _Ps_AT_val = spspmm(_sym.indices(), _sym.values(), MT_idx, MT_val, _sym.size(0), _sym.size(1), _M.size(0))
     
     # _top_k = _k - int(torch.sum(_M == 1).item())
 
@@ -92,7 +93,7 @@ def create_loss_fn(loss_type, **kwargs):
             Ps_AT_idx, Ps_AT_val = spspmm(Ps.indices(), Ps.values(), MT_idx, MT_val, n*n, n*n, n*n)
         else:
             M_idx, M_val = M.indices(), M.values()
-            Ps_AT_idx, Ps_AT_val = _Ps_AT_idx, _Ps_AT_val 
+            Ps_AT_idx, Ps_AT_val = _Ps_AT.indices(), _Ps_AT.values() 
         time1 = time.time()
         sq = X @ X.T - Z @ Z.T
         res = sq + e
