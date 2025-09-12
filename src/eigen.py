@@ -26,9 +26,10 @@ def build_hvp_operator(f, X, e, Z, P):
 
 
 def power_method(f, X, e, Z, P, tol=1e-4, iters=50, margin=1.05):
+    device = X.device
     hvp = build_hvp_operator(f, X, e, Z, P)
     # Estimate alpha
-    v = torch.randn_like(X).view(-1)
+    v = torch.randn_like(X).view(-1).to(device)
     v = v / (torch.linalg.norm(v) + 1e-18)
     for i in range(8):
         w = hvp(v, True)
@@ -36,7 +37,7 @@ def power_method(f, X, e, Z, P, tol=1e-4, iters=50, margin=1.05):
     lamb_max = torch.dot(v, hvp(v, True))
     alpha = margin * lamb_max
     # Compute lambda min
-    v = torch.randn_like(X).view(-1)
+    v = torch.randn_like(X).view(-1).to(device)
     v = v / (torch.linalg.norm(v) + 1e-18)
     for i in range(iters):
         Hv = hvp(v, True)
@@ -49,13 +50,14 @@ def power_method(f, X, e, Z, P, tol=1e-4, iters=50, margin=1.05):
     return lamb_min
 
 def lanczos(f, X, e, Z, P, tol=1e-4):
+    device = X.device
     hvp = build_hvp_operator(f, X, e, Z, P)
     def _scipy_apply(x):
-        x = torch.from_numpy(x).to(torch.float64)
+        x = torch.from_numpy(x).to(device)
         # print("Start")
         out = hvp(x, True)
         # print("end")
-        return out.detach().numpy()
+        return out.detach().cpu().numpy()
     n = X.numel()
     scipy_op = LinearOperator((n, n), _scipy_apply)
     eigenvals, eigenvecs = eigsh(
@@ -67,7 +69,7 @@ def lanczos(f, X, e, Z, P, tol=1e-4):
         ncv     = 40,
         return_eigenvectors = True,
     )
-    v = torch.from_numpy(eigenvecs[:, 0]).to(torch.float64)
+    v = torch.from_numpy(eigenvecs[:, 0]).to(device)
     v = v / (torch.linalg.norm(v) + 1e-18)
     lamb_min = torch.dot(v.detach(), hvp(v.detach(), create_graph=True))
     return lamb_min

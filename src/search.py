@@ -96,7 +96,8 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
         w, h = X.size()
         time1 = time.time()
         f_Z, _ = f(Z, e, Z, P, tau=tau, diff=False)
-        f_X, sq_loss, grad_X, hess_X = f(X, e, Z, P, tau=tau, diff=True)
+        # f_X, sq_loss, grad_X, hess_X = f(X, e, Z, P, tau=tau, diff=True)
+        f_X, sq_loss = f(X, e, Z, P, tau=tau, diff=False)
         transform_loss = -sq_loss
         time2 = time.time()
         # print("gradient closed form: ", grad_X)
@@ -107,11 +108,14 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
         # hessians = hessian(f, (X, e, Z, P), create_graph=True)
         # hessian_X = hessians[0][0].reshape(w,h,-1).reshape(w*h,-1)
         # hessian_X = (hessian_X + hessian_X.T) / 2
-        first_order_loss_X = torch.linalg.norm(grad_X)
+        # first_order_loss_X = torch.linalg.norm(grad_X)
+        grad_X = grad(f(X, e, Z, P), X, create_graph=True)
+        first_order_loss_X = torch.linalg.norm(grad_X[0])
         # second_order_loss_X = -torch.linalg.eigvalsh(hessian_X)[0]
         time3 = time.time()
-        eigvals = eigvalsh(hess_X)
-        second_order_loss_X = -eigvals[0]
+        # eigvals = eigvalsh(hess_X)
+        # second_order_loss_X = -eigvals[0]
+        second_order_loss_X = -power_method(f, X, e, Z, P, tol=1e-4)
         time4 = time.time()
         # eigen_decomp(f, X, e, Z, P) # torch.tensor([0.0], dtype=torch.float64) #
         # print(second_order_loss_X)
@@ -387,7 +391,6 @@ def compute_X_Z_e(
         M       = M,
         sym     = Ps,
         Ps_AT   = Ps_AT,
-        diff    = True
     )
     criterion = create_search_loss_fn(
         loss_fn, 
