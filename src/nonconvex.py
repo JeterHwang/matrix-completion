@@ -93,7 +93,7 @@ def create_loss_fn(loss_type, **kwargs):
             Ps_AT_idx, Ps_AT_val = spspmm(Ps.indices(), Ps.values(), MT_idx, MT_val, n*n, n*n, n*n)
         else:
             M_idx, M_val = M.indices(), M.values()
-            Ps_AT_idx, Ps_AT_val = _Ps_AT.indices(), _Ps_AT.values() 
+            # Ps_AT_idx, Ps_AT_val = _Ps_AT.indices(), _Ps_AT.values() 
         time1 = time.time()
         sq = X @ X.T - Z @ Z.T
         res = sq + e
