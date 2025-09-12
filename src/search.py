@@ -115,7 +115,7 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
         time3 = time.time()
         # eigvals = eigvalsh(hess_X)
         # second_order_loss_X = -eigvals[0]
-        second_order_loss_X = -power_method(f, X, e, Z, P, tol=1e-4)
+        second_order_loss_X = -lanczos(f, X, e, Z, P, tol=1e-4)
         time4 = time.time()
         # eigen_decomp(f, X, e, Z, P) # torch.tensor([0.0], dtype=torch.float64) #
         # print(second_order_loss_X)
