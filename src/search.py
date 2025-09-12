@@ -371,10 +371,10 @@ def compute_X_Z_e(
             else:
                 e = val.to(device)
         elif name == 'M':
-            Ps = symbasis(n)
-            M = val
-            Ps_AT = torch.sparse.mm(Ps, M.T)
-            Ps, M, Ps_AT = Ps.to(device), M.to(device), Ps_AT.to(device)
+            # Ps = symbasis(n)
+            M = val.to(device)
+            # Ps_AT = torch.sparse.mm(Ps, M.T)
+            # Ps, M, Ps_AT = Ps.to(device), M.to(device), Ps_AT.to(device)
     # check whether we need to train the mask
     P = torch.rand(n*n, device=device)
     if top_k > 0:
@@ -389,8 +389,8 @@ def compute_X_Z_e(
         top_k   = top_k,
         M_type  = M_type,
         M       = M,
-        sym     = Ps,
-        Ps_AT   = Ps_AT,
+        # sym     = Ps,
+        # Ps_AT   = Ps_AT,
     )
     criterion = create_search_loss_fn(
         loss_fn, 
