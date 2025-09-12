@@ -315,7 +315,7 @@ def create_mask(
     else:
         raise NotImplementedError
     mask = torch.sparse_coo_tensor(torch.cat([mask_idx, M.indices()], dim=1), torch.cat([mask_val, M.values()]), (M.size(0), M.size(1))).coalesce()
-    return mask
+    return mask.to(prob_mat.device)
 
 def extend_mask_coo(
     M: torch.Tensor,            # COO 
@@ -371,7 +371,7 @@ def symbasis(n: int) -> torch.Tensor:
     return torch.sparse_coo_tensor(phi_phi_T_idx, phi_phi_T_val, (n*n, n*n)).coalesce()
 
 
-def kron_X_I(X, dim):
+def kron_X_I(X: torch.Tensor, dim):
     row_idx = torch.stack([torch.arange(X.size(0)*dim) for _ in range(X.size(1))]).T
     col_idx_1 = torch.arange(dim).reshape((dim, 1)) + torch.arange(X.size(1)).reshape((1, X.size(1))) * dim
     col_idx = torch.cat([col_idx_1 for _ in range(X.size(0))])
@@ -380,10 +380,10 @@ def kron_X_I(X, dim):
     # print(indices, values)
     # dense = torch.kron(X.contiguous(), torch.eye(dim))
     # return dense.to_sparse_coo()
-    return indices, values
+    return indices.to(X.device), values.to(X.device)
     # return torch.sparse_coo_tensor(indices, values, (X.size(0)*dim, X.size(1)*dim)).coalesce()
 
-def kron_I_X(X, dim):
+def kron_I_X(X: torch.Tensor, dim):
     row_idx = torch.stack([torch.arange(X.size(0) * dim) for _ in range(X.size(1))]).T
     col_idx_1 = torch.cat([torch.arange(X.size(1)) for _ in range(X.size(0))])
     col_idx = torch.arange(dim).reshape((dim, 1)) * X.size(1) + col_idx_1.reshape((1, -1)) 
@@ -391,7 +391,7 @@ def kron_I_X(X, dim):
     indices = torch.stack([row_idx.reshape(-1), col_idx.reshape(-1)])
     # dense = torch.kron(torch.eye(dim), X.contiguous())
     # return dense.to_sparse_coo()
-    return indices, values
+    return indices.to(X.device), values.to(X.device)
     # return torch.sparse_coo_tensor(indices, values, (X.size(0)*dim, X.size(1)*dim)).coalesce()
 
 
@@ -409,7 +409,7 @@ def logits2prob(
         prob_mat = torch.sparse_coo_tensor(prob_mat_idx, prob_mat_val, (len(logits), len(logits))).coalesce()
     else:
         raise NotImplementedError
-    return prob_mat
+    return prob_mat.to(logits.device)
 
 def calc_loss_coeff(alpha_0, beta_0, alpha_t, beta_t, i, iters, scale_type='linear'):
     if scale_type == 'static':

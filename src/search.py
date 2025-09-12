@@ -7,9 +7,19 @@ from tqdm import tqdm
 from torch.autograd import grad
 from torch.func import jacrev
 from torch.autograd.functional import hessian
-from torch.linalg import eigh
-from src.utils import incoherence_proj, mag_ang_proj, calc_loss_coeff, emb2rect
+from torch.linalg import eigh, eigvalsh
+from src.utils import (
+    incoherence_proj, 
+    emb2rect, 
+    symbasis, 
+    create_mask, 
+    same_seed, 
+    logits2prob
+)
 from src.eigen import lanczos, power_method, eigen_decomp
+from src.nonconvex import create_loss_fn
+from src.verify import check_MC
+from src.plot import plot_loss
 
 def create_search_proj_fn(proj_type, **kwargs):
     @torch.no_grad()
@@ -83,16 +93,16 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
         tau             = 1,
     ): 
         assert X.size() == Z.size()
-        f.__defaults__ = f.__defaults__[:-1] + (tau,)
         w, h = X.size()
         time1 = time.time()
-        f_Z, _ = f(Z, e, Z, P, diff=False)
-        f_X, sq_loss, grad_X, hess_X = f(X, e, Z, P, diff=True)
+        f_Z, _ = f(Z, e, Z, P, tau=tau, diff=False)
+        f_X, sq_loss, grad_X, hess_X = f(X, e, Z, P, tau=tau, diff=True)
+        transform_loss = -sq_loss
         time2 = time.time()
         # print("gradient closed form: ", grad_X)
         # print(f_X, sq_loss, grad_X, hess_X)
         diff_loss = f_Z - f_X 
-        dist_loss = -torch.linalg.norm(X - Z)
+        # dist_loss = -torch.linalg.norm(X - Z)
         # gradients = grad(f(X, e, Z, P), X, create_graph=True)
         # hessians = hessian(f, (X, e, Z, P), create_graph=True)
         # hessian_X = hessians[0][0].reshape(w,h,-1).reshape(w*h,-1)
@@ -100,7 +110,7 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
         first_order_loss_X = torch.linalg.norm(grad_X)
         # second_order_loss_X = -torch.linalg.eigvalsh(hessian_X)[0]
         time3 = time.time()
-        eigvals, eigvecs = eigh(hess_X)
+        eigvals = eigvalsh(hess_X)
         second_order_loss_X = -eigvals[0]
         time4 = time.time()
         # eigen_decomp(f, X, e, Z, P) # torch.tensor([0.0], dtype=torch.float64) #
@@ -113,14 +123,14 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
         # print(f"Compute eigen decomposition: {time4 - time3}")
         max_loss = torch.maximum(first_order_loss_X, second_order_loss_X)
         return (
-            alpha * sq_loss + beta * max_loss, 
+            alpha * transform_loss + beta * max_loss, 
             diff_loss, 
             first_order_loss_X, 
             second_order_loss_X, 
             f_X, 
             f_Z, 
-            dist_loss,
-            sq_loss,
+            # dist_loss,
+            transform_loss,
             max_loss
         )
     
@@ -158,43 +168,25 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
             thmin   : float         = _thmin,   # Not optimized
             thmax   : float         = _thmax,   # Not optimized
         ): # Use PSSE-1
-        f.__defaults__ = f.__defaults__[:-1] + (tau,)
-        X_rect = emb2rect(X, Vmin, Vmax, thmin, thmax)
-        Z_rect = emb2rect(Z, Vmin, Vmax, thmin, thmax)
-        w, h = X_rect.size()
         #################
-        f_X = f(X_rect, e, Z_rect, P)
-        f_Z = f(Z_rect, e, Z_rect, P)
+        f_X, sq_loss, grad_X, hess_X = f(X, e, Z, P, tau=tau, Vmin=Vmin, Vmax=Vmax, thmin=thmin, thmax=thmax, diff=True)
+        f_Z, _ = f(Z, e, Z, P, tau=tau, Vmin=Vmin, Vmax=Vmax, thmin=thmin, thmax=thmax, diff=False)
         diff_loss = f_Z - f_X
-        transform_loss = -torch.linalg.matrix_norm(X_rect @ X_rect.T - Z_rect @ Z_rect.T, ord='fro')
-        dist_loss = -torch.linalg.norm(X_rect - Z_rect)
-        ##################
-        gradients = grad(f(X_rect, e, Z_rect, P), [X_rect], create_graph=True)
-        # hessians = hessian(f, (X_rect, e, Z_rect, P), create_graph=True)
-        # hessian_X = hessians[0][0].reshape(w,h,-1).reshape(w*h,-1)
-        # hessian_X = (hessian_X + hessian_X.T) / 2
-        # hessian_Z = hessians[2][2].reshape(w,h,-1).reshape(w*h,-1)
-        # hessian_Z = (hessian_Z + hessian_Z.T) / 2
-        grad_X = torch.linalg.norm(gradients[0])
-        # grad_Z = torch.linalg.norm(gradients[1])
-        # eig_min_X = torch.nn.functional.softplus(-torch.linalg.eigvalsh(hessian_X)[0] / tau) * tau
-        eig_min_X = -lanczos(f, X_rect, e, Z_rect, P)
-        # eig_min_X = -torch.linalg.eigvalsh(hessian_X)[0]
-        # eig_min_Z = -torch.linalg.eigvalsh(hessian_Z)[0]
-        feasible_loss_X = torch.maximum(grad_X, eig_min_X)
-        # feasible_loss_X = tau * torch.log(torch.exp(grad_X / tau) + torch.exp(eig_min_X / tau))
-        # feasible_loss_Z = torch.maximum(grad_Z, eig_min_Z)
-        # feasible_loss = feasible_loss_X + feasible_loss_Z
+        transform_loss = -sq_loss
+        first_order_loss_X = torch.linalg.norm(grad_X)
+        eigvals = eigvalsh(hess_X)
+        second_order_loss_X = -eigvals[0]
+        max_loss = torch.maximum(first_order_loss_X, second_order_loss_X)
         return (
-            alpha * transform_loss + beta * feasible_loss_X, 
+            alpha * transform_loss + beta * max_loss, 
             diff_loss, 
-            grad_X, 
-            eig_min_X,
+            first_order_loss_X, 
+            second_order_loss_X,
             f_X, 
             f_Z, 
-            dist_loss,
+            # dist_loss,
             transform_loss,
-            feasible_loss_X
+            max_loss
         )
     
     if loss_type == 'MC_sum':
@@ -245,7 +237,7 @@ def search(
         raise NotImplementedError
     losses = []
     # Pre-test
-    loss_0, diff_0, grad_X_0, hess_X_0, f_X_0, f_Z_0, dist_0, trans_0, max_loss_0 = criterion(**parameters)
+    loss_0, diff_0, grad_X_0, hess_X_0, f_X_0, f_Z_0, trans_0, max_loss_0 = criterion(**parameters)
     losses.append((loss_0.item(), diff_0.item(), grad_X_0.item(), hess_X_0.item(), f_X_0.item(), f_Z_0.item(), trans_0.item()))
     # T = torch.sum(coeff.detach())
     alpha, beta, tau = 1, 1, 1
@@ -258,12 +250,12 @@ def search(
             # alpha = coeff.detach()[0]
             # beta = coeff.detach()[1]
             time1 = time.time()
-            loss, diff, grad_X, hess_X, f_X, f_Z, dist, trans, max_loss = criterion(**parameters, alpha=alpha, beta=beta, tau=tau)
+            loss, diff, grad_X, hess_X, f_X, f_Z, trans, max_loss = criterion(**parameters, alpha=alpha, beta=beta, tau=tau)
             # print(parameters, f_X.item(), f_Z.item(), trans.item(), grad_X.item(), hess_X.item(), max_loss.item())
             time2 = time.time()
-            # inputs = [parameters['X'], parameters['Z']] if 'Z' in parameters else [parameters['X']]
-            # gradients_1 = grad(outputs=trans, inputs=inputs, retain_graph=True, allow_unused=True)
-            # gradients_2 = grad(outputs=max_loss, inputs=inputs, retain_graph=True, allow_unused=True)
+            inputs = [parameters['X'], parameters['Z']] if 'Z' in parameters else [parameters['X']]
+            gradients_1 = grad(outputs=trans, inputs=inputs, retain_graph=True, allow_unused=True)
+            gradients_2 = grad(outputs=max_loss, inputs=inputs, retain_graph=True, allow_unused=True)
             optimizer_W.zero_grad()
             time3 = time.time()
             loss.backward()
@@ -274,8 +266,8 @@ def search(
             # if clip_grad:
             #     torch.nn.utils.clip_grad_norm_(parameters, max_norm=1.0, norm_type=2)
             
-            # grad_norm_1 = torch.sqrt(sum([0 if GG is None else torch.linalg.norm(GG).square() for GG in gradients_1]))
-            # grad_norm_2 = torch.sqrt(sum([0 if GG is None else torch.linalg.norm(GG).square() for GG in gradients_2]))
+            grad_norm_1 = torch.sqrt(sum([0 if GG is None else torch.linalg.norm(GG).square() for GG in gradients_1]))
+            grad_norm_2 = torch.sqrt(sum([0 if GG is None else torch.linalg.norm(GG).square() for GG in gradients_2]))
             
             # if i % 1000 == 0:
             #     print(grad_norm_1, grad_norm_2)
@@ -286,13 +278,13 @@ def search(
             # g2 = grad_norm_1.item() / (grad_norm_1.item() + grad_norm_2.item())
             
             # boost = 0.5 * (1 + 3) + 0.5 * (3 - 1) * np.cos(np.pi * i / iters)
-            # r1 = (trans.item() - trans_0.item()) / (trans_bound[0] - trans_0.item())
-            # r2 = (max_loss_0.item() - max_loss.item()) / max_loss_0.item() * boost
-            # alpha = min(grad_norm_2.item() / grad_norm_1.item(), 50) * (np.exp(r1 * T) / (np.exp(r1 * T) + np.exp(r2 * T)))
-            # beta =  (np.exp(r2 * T) / (np.exp(r1 * T) + np.exp(r2 * T)))
+            r1 = (trans.item() - trans_0.item()) / (trans_bound[0] - trans_0.item())
+            r2 = (max_loss_0.item() - max_loss.item()) / max_loss_0.item() # * boost
+            alpha = grad_norm_2.item() / grad_norm_1.item() * (np.exp(r1 * T) / (np.exp(r1 * T) + np.exp(r2 * T)))
+            beta =  (np.exp(r2 * T) / (np.exp(r1 * T) + np.exp(r2 * T)))
             tau = 0.5 * (0.5 + 0.05) + 0.5 * (0.5 - 0.05) * np.cos(np.pi * i / iters)
-            alpha = 0.01
-            beta = 100
+            # alpha = 0.01
+            # beta = 100
             # r1 = trans.item() / trans_0          # f1_init cached at step 0
             # r2 = max_loss.item() / max_loss_0
             # r_bar = 0.5 * (r1 + r2)
@@ -335,6 +327,333 @@ def search(
             elif trans < trans_bound[1]:
                 logging.warning("transform loss explodes !!")
                 break
-            pbar.set_description(f"lr={new_lr:.6f}, diff={diff.item():.2f}, dist={dist.item():.2f}, trans={trans.item():.4f}, grad={grad_X.item():.4f}, hess={hess_X.item():.4f}, coeff=({alpha:.2f},{beta:.2f})")
+            pbar.set_description(f"lr={new_lr:.6f}, diff={diff.item():.2f}, trans={trans.item():.2f}, grad={grad_X.item():.2f}, hess={hess_X.item():.2f}, coeff=({alpha:.2f},{beta:.2f})")
             pbar.update(1)
     return losses
+
+def compute_X_Z_e(
+    variables, 
+    top_k, 
+    n, 
+    r, 
+    mu, 
+    e_norm, 
+    loss_type   = 'MC_max', 
+    optim       = 'Adam', 
+    iters       = 100, 
+    lr          = 0.001, 
+    min_lr      = 5e-5, 
+    lr_sched    = 'cosine', 
+    T           = 1, 
+    trans_bound = (-1e-2, -1e2),
+    M_type      = 'STE',
+    device      = torch.device('cpu'),
+):
+    parameters = {}
+    for name, val  in variables.items():
+        if name == 'X':
+            X = torch.normal(mean=0.0, std=torch.ones((n, r))).to(torch.float64).to(device).requires_grad_()
+            parameters['X'] = X
+        elif name == 'Z':
+            if val is None:
+                Z = torch.normal(mean=0.0, std=torch.ones((n, r))).to(torch.float64).to(device).requires_grad_()
+                parameters['Z'] = Z
+            else:
+                Z = val.to(device)
+        elif name == 'e':
+            if val is None:
+                e = torch.zeros((n, n), requires_grad=True, dtype=torch.float64, device=device)
+                parameters['e'] = e
+            else:
+                e = val.to(device)
+        elif name == 'M':
+            M = val.to(device)
+    # check whether we need to train the mask
+    P = torch.rand(n*n, dtype=torch.float64, device=device)
+    if top_k > 0:
+        P.requires_grad_()
+        parameters['P'] = P
+    
+    loss_fn = create_loss_fn(
+        'MC_PSD', 
+        P       = P.detach(),
+        Z       = Z.detach(),
+        e       = e.detach(),
+        top_k   = top_k,
+        M_type  = M_type,
+        M       = M.detach(),
+        sym     = symbasis(n).to(device),
+        diff    = True
+    )
+    criterion = create_search_loss_fn(
+        loss_fn, 
+        loss_type, 
+        P = P.detach(),
+        Z = Z.detach(),
+        e = e.detach(),
+    )
+    proj_fn = create_search_proj_fn(
+        'MC', 
+        mu = mu, 
+        max_norm = e_norm
+    )
+    proj_fn(**parameters)
+    losses = search(
+        parameters,
+        criterion,
+        proj_fn,
+        optim,
+        iters,
+        lr,
+        min_lr,
+        lr_sched,
+        T,
+        trans_bound,
+    )
+    
+    return parameters, losses
+
+def search_counter(
+    variables, 
+    top_k, 
+    n,
+    e_norm, 
+    A,                          # COO format
+    loss_type   = 'PSSE_max', 
+    optim       = 'Adam', 
+    iters       = 100, 
+    lr          = 0.001, 
+    min_lr      = 5e-5, 
+    lr_sched    = 'cosine', 
+    T           = 1, 
+    trans_bound = (-1, -1e-2), 
+    constraints = (0.3, 1, -torch.pi/2, torch.pi/2),
+    M_type      = 'STE'
+):
+    # x_0 = PSSE_initialization(z, 1.0)
+    # x = torch.tensor(np.concatenate([x_0.real, x_0.imag]), requires_grad=True, dtype=torch.float64)
+    d = A.size(0)
+    parameters = {}
+    for name, val  in variables.items():
+        if name == 'X':
+            X = torch.normal(0.0, 3.0 * torch.ones((n, 1))).to(torch.float64).requires_grad_()
+            parameters['X'] = X
+        elif name == 'Z':
+            if val is None:
+                Z = torch.normal(0.0, 3.0 * torch.ones((n, 1))).to(torch.float64).requires_grad_()
+                parameters['Z'] = Z
+            else:
+                Z = val
+        elif name == 'e':
+            if val is None:
+                e = torch.zeros(len(A), requires_grad=True, dtype=torch.float64)
+                parameters['e'] = e
+            else:
+                e = val
+        elif name == 'M':
+            M = val
+        
+    # check whether we need to train the mask
+    P = torch.rand(d, dtype=torch.float64)
+    if top_k > 0:
+        P.requires_grad_()
+        parameters['P'] = P
+    
+    loss_fn = create_loss_fn(
+        'PSSE', 
+        P       = P.detach(), 
+        Z       = Z.detach(), 
+        e       = e.detach(),
+        top_k   = top_k,
+        A       = A,
+        M_type  = M_type,
+        M       = M.detach(),
+        sym     = symbasis(n),
+        diff    = True
+    )
+    criterion = create_search_loss_fn(
+        loss_fn, 
+        loss_type, 
+        P = P.detach(),
+        Z = Z.detach(), 
+        e = e.detach(),
+        Vmin = constraints[0],
+        Vmax = constraints[1],
+        thmin = constraints[2],
+        thmax = constraints[3],
+    )
+    proj_fn = create_search_proj_fn('PSSE', max_norm=e_norm)
+    proj_fn(**parameters)
+    losses = search(
+        parameters,
+        criterion,
+        proj_fn,
+        optim,
+        iters,
+        lr,
+        min_lr,
+        lr_sched,
+        T,
+        trans_bound
+    )
+    return parameters, losses
+
+def DSE_MC(
+    top_k, 
+    search_loops, 
+    device,
+    n, 
+    r, 
+    mu, 
+    e_norm,  
+    loss_type   = 'A', 
+    optim       = 'Adam', 
+    iters       = 100, 
+    lr          = 0.001, 
+    min_lr      = 5e-5, 
+    lr_sched    = 'cosine', 
+    T           = 1, 
+    trans_bound = (-1e-1, -1e2),
+    M_type      = 'STE',
+    M           = None,         # COO
+    save_path   = None,
+):
+    npy_path = save_path / "npys"
+    fig_path = save_path / "figs"
+    npy_path.mkdir(parents=True, exist_ok=True)
+    fig_path.mkdir(parents=True, exist_ok=True)
+    
+    for i in range(search_loops):
+        logging.info(f"========== Search Loop {i} ==========")
+        variables = {
+            "X": None,
+            "Z": None,
+            "e": None,
+            "M": M,
+        }
+        _top_k = top_k - len(M.values())
+        parameters, losses = compute_X_Z_e(
+            variables,
+            _top_k,
+            n, 
+            r,  
+            mu,
+            e_norm, 
+            loss_type, 
+            optim, 
+            iters, 
+            lr, 
+            min_lr,
+            lr_sched,
+            T,
+            trans_bound,
+            M_type,
+            device
+        ) 
+        plot_loss(fig_path / f"iter-{i}.png", losses)
+        if len(losses) < iters + 1: # Early Stop
+            continue
+        # print_counter_MC(f"Search Loop {i}", _top_k, parameters, losses, M=mask, M_type=M_type)
+        flag, categories = check_MC(
+            parameters,
+            _top_k,
+            mu, 
+            PSD         = True,
+            M           = M,
+            M_type      = M_type,
+            verbose     = True,
+            save_path   = npy_path / f"iter-{i}.npy"
+        )
+        if flag:
+            logging.info(categories)
+
+def DSE_PSSE(
+    top_k, 
+    search_loops, 
+    e_norm, 
+    A,
+    loss_type       = 'PSSE_max', 
+    optim           = 'Adam', 
+    iters           = 100, 
+    lr              = 0.001, 
+    min_lr          = 5e-5, 
+    lr_sched        = 'cosine', 
+    T               = 1, 
+    trans_bound     = (-1, -1e2), 
+    constraints     = (0.3, 1, -torch.pi/2, torch.pi/2),
+    M_type          = 'STE',
+    M               = None,
+    save_path   = None,
+):
+    Pareto = []
+    for i in range(search_loops):
+        logging.info(f"================== Search Iteration : {i} ==================")
+        # Search for (X, Z, e)
+        variables = {
+            "X": None,
+            "Z": None,
+            "e": None,
+            "M": M,
+        }
+        _top_k = top_k - len(M.values())
+        parameters, losses = search_counter(
+            variables,
+            _top_k, 
+            e_norm, 
+            A,
+            loss_type, 
+            optim, 
+            iters, 
+            lr, 
+            min_lr,
+            lr_sched, 
+            T,
+            trans_bound,
+            constraints,
+            M_type,
+        )
+        if len(losses) < iters + 1: # Early Stop
+            continue
+        loss_fn = create_loss_fn(
+            'PSSE', 
+            P       = parameters['P'].detach() if 'P' in parameters else M, 
+            Z       = parameters['Z'].detach(), 
+            top_k   = _top_k,
+            A       = A,
+            is_rect = False,
+            Vmin    = constraints[0],
+            Vmax    = constraints[1],
+            thmin   = constraints[2],
+            thmax   = constraints[3],
+            M       = M,
+            M_type  = M_type
+        )
+        proj_fn = create_proj_fn('PSSE')
+        plot_contour(f"search-{i} (before)", parameters['X'].detach(), parameters['Z'].detach(), loss_fn, constraints)
+        flag = check_PSSE(  # fist check
+            parameters['X'], 
+            parameters['Z'],
+            loss_fn,
+            proj_fn,
+            constraints
+        )
+        if flag:  
+            categories = check_random( # double check
+                50,
+                parameters['X'],
+                parameters['Z'],
+                loss_fn,
+                proj_fn,
+                constraints,
+            )
+            logging.info(categories)
+            if categories['X'] != 0:
+                logging.info(f"{'=> Total loss':<27} {'=':^1} {losses[-1][0]:>10.2e}")
+                logging.info(f"{'=> f(Z) - f(X)':<27} {'=':^1} {losses[-1][1]:>10.2e}")
+                logging.info(f"{'=> |gradient(X)|':<27} {'=':^1} {losses[-1][2]:>10.2e}")
+                logging.info(f"{'=> -lambda_min(hessian(X))':<27} {'=':^1} {losses[-1][3]:>10.2e}")
+                logging.info(f"{'=> |XX^T-ZZ^T|_F':<27} {'=':^1} {losses[-1][6]:>10.2e}")
+                logging.info(f"{'=> |X-Z|_F':<27} {'=':^1} {torch.linalg.norm(emb2rect(parameters['X'], *constraints) - emb2rect(parameters['Z'], *constraints), ord='fro'):>10.2e}")
+                Pareto.append((categories, copy.deepcopy(parameters)))
+    return Pareto
+    
