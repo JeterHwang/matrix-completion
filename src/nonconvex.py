@@ -28,10 +28,13 @@ def create_loss_fn(loss_type, **kwargs):
     _diff   = kwargs['diff'] if 'diff' in kwargs else False
     
     if _A is not None: # PSSE
-        MA = torch.sparse.mm(_M, _A)
-        Ps_AT = torch.sparse.mm(_sym, MA.T)
+        MA_idx, MA_val = spspmm(_M.indices(), _M.values(), _A.indices(), _A.values(), _M.size(0), _M.size(1), _A.size(1)) # torch.sparse.mm(_M, _A)
+        MAT_idx, MAT_val = transpose(MA_idx, MA_val, _M.size(0), _A.size(1))
+        _Ps_AT_idx, _Ps_AT_val = spspmm(_sym.indices(), _sym.values(), MAT_idx, MAT_val, _sym.size(0), _sym.size(1), _M.size(0))
+        # Ps_AT = torch.sparse.mm(_sym, MA.T)
     else:
-        Ps_AT = torch.sparse.mm(_sym, _M.T)
+        MT_idx, MT_val = transpose(_M.indices(), _M.values(), _M.size(0), _M.size(1))
+        _Ps_AT_idx, _Ps_AT_val = spspmm(_sym.indices(), _sym.values(), MT_idx, MT_val, _sym.size(0), _sym.size(1), _M.size(0))
     
     # _top_k = _k - int(torch.sum(_M == 1).item())
 
@@ -85,12 +88,11 @@ def create_loss_fn(loss_type, **kwargs):
             mask = create_mask(prob_mat, top_k, M_type, _M)  # Sparse COO
             mask = (mask - prob_mat).detach() + prob_mat
             M_idx, M_val = mask.indices(), mask.values()
-            print(M_idx.device, M_val.device)
             MT_idx, MT_val = transpose(M_idx, M_val, n*n, n*n)
             Ps_AT_idx, Ps_AT_val = spspmm(Ps.indices(), Ps.values(), MT_idx, MT_val, n*n, n*n, n*n)
         else:
             M_idx, M_val = M.indices(), M.values()
-            Ps_AT_idx, Ps_AT_val = Ps_AT.indices(), Ps_AT.values()
+            Ps_AT_idx, Ps_AT_val = _Ps_AT_idx, _Ps_AT_val 
         time1 = time.time()
         sq = X @ X.T - Z @ Z.T
         res = sq + e
