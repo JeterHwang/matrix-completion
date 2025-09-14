@@ -95,13 +95,13 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
         assert X.size() == Z.size()
         w, h = X.size()
         time1 = time.time()
-        f_Z, _ = f(Z, e, Z, P, tau=tau, diff=False)
-        f_X, sq_loss, grad_X, hess_X = f(X, e, Z, P, tau=tau, diff=True)
+        # f_Z, _ = f(Z, e, Z, P, tau=tau, diff=False)
+        # f_X, sq_loss, grad_X, hess_X = f(X, e, Z, P, tau=tau, diff=True)
         # print(grad_X)
         # print(hess_X)
-        # f_Z = f(Z, e, Z, P, tau=tau, diff=False)
-        # f_X = f(X, e, Z, P, tau=tau, diff=False)
-        transform_loss = -sq_loss
+        f_Z = f(Z, e, Z, P)
+        f_X = f(X, e, Z, P)
+        # transform_loss = -sq_loss
         time2 = time.time()
         # print("gradient closed form: ", grad_X)
         # print(f_X, sq_loss, grad_X, hess_X)
@@ -112,20 +112,20 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
         # hessian_X = hessians[0][0].reshape(w,h,-1).reshape(w*h,-1)
         # hessian_X = (hessian_X + hessian_X.T) / 2
         
-        first_order_loss_X = torch.linalg.norm(grad_X)
-        # grad_X = grad(f(X, e, Z, P), X, create_graph=True)
+        # first_order_loss_X = torch.linalg.norm(grad_X)
+        grad_X = grad(f(X, e, Z, P), X, create_graph=True)
         # print(grad_X)
-        # first_order_loss_X = torch.linalg.norm(grad_X[0])
+        first_order_loss_X = torch.linalg.norm(grad_X[0])
         
         time3 = time.time()
-        eigvals = eigvalsh(hess_X)
-        second_order_loss_X = -eigvals[0]
-        # second_order_loss_X = -lanczos(f, X, e, Z, P)
+        # eigvals = eigvalsh(hess_X)
+        # second_order_loss_X = -eigvals[0]
+        second_order_loss_X = -lanczos(f, X, e, Z, P)
         time4 = time.time()
         # eigen_decomp(f, X, e, Z, P) # torch.tensor([0.0], dtype=torch.float64) #
         # print(second_order_loss_X)
         
-        # transform_loss = -torch.linalg.matrix_norm(X @ X.T - Z @ Z.T, ord='fro')
+        transform_loss = -torch.linalg.matrix_norm(X @ X.T - Z @ Z.T, ord='fro')
         
         # print(f"Compute loss, grad, hess: {time2 - time1} (s)")
         # print(f"Compute norm: {time3 - time2} (s)")
@@ -133,7 +133,7 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
         # print(first_order_loss_X, second_order_loss_X)
         max_loss = torch.maximum(first_order_loss_X, second_order_loss_X)
         return (
-            max_loss, 
+            alpha * transform_loss + beta * max_loss, 
             diff_loss, 
             first_order_loss_X, 
             second_order_loss_X, 
@@ -380,26 +380,26 @@ def compute_X_Z_e(
             else:
                 e = val.to(device)
         elif name == 'M':
-            Ps = symbasis(n)
-            M = val
-            Ps_AT = torch.sparse.mm(Ps, M.T)
-            Ps, M, Ps_AT = Ps.to(device), M.to(device), Ps_AT.to(device)
+            # Ps = symbasis(n)
+            M = val.to(device)
+            # Ps_AT = torch.sparse.mm(Ps, M.T)
+            # Ps, M, Ps_AT = Ps.to(device), M.to(device), Ps_AT.to(device)
     # check whether we need to train the mask
-    P = torch.rand(n*n, device=device)
+    P = torch.rand((n, n), device=device)
     if top_k > 0:
         P.requires_grad_()
         parameters['P'] = P
     
     loss_fn = create_loss_fn(
-        'MC_PSD', 
+        'MC_PSD_dense', 
         P       = P.detach(),
         Z       = Z.detach(),
         e       = e.detach(),
         top_k   = top_k,
         M_type  = M_type,
         M       = M,
-        sym     = Ps,
-        Ps_AT   = Ps_AT,
+        # sym     = Ps,
+        # Ps_AT   = Ps_AT,
     )
     criterion = create_search_loss_fn(
         loss_fn, 
@@ -547,10 +547,10 @@ def DSE_MC(
             "e": None,
             "M": M,
         }
-        _top_k = top_k - len(M.values())
+        
         parameters, losses = compute_X_Z_e(
             variables,
-            _top_k,
+            top_k,
             n, 
             r,  
             mu,
@@ -572,7 +572,7 @@ def DSE_MC(
         # print_counter_MC(f"Search Loop {i}", _top_k, parameters, losses, M=mask, M_type=M_type)
         flag, categories = check_MC(
             parameters,
-            _top_k,
+            top_k,
             mu, 
             PSD         = True,
             M           = M,

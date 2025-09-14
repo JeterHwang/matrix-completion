@@ -293,14 +293,14 @@ def rect2emb(X: torch.Tensor, Vmin, Vmax, thmin, thmax):
     return torch.cat([V_emb, ang_emb], dim=0)
 
 def create_mask(
-    prob_mat: torch.Tensor,     # COO
+    prob_mat: torch.Tensor,     # (n,n)
     top_k   : int,
     M_type  : str,
-    M       : torch.Tensor,     # COO
+    M       : torch.Tensor,     # (n,n)
 ):
     if top_k <= 0:
         return M
-    flatten = prob_mat - M * 1e9
+    flatten = prob_mat.reshape(-1) - M.reshape(-1) * 1e9   # 1D
     # if M_type == 'entmax':
     #     if train:
     #         mask = flatten
@@ -309,13 +309,30 @@ def create_mask(
     #         mask = torch.zeros_like(flatten, dtype=prob_mat.dtype)
     #         mask[indices] = 1
     if M_type == 'STE':
-        _, idx = torch.topk(flatten.values(), k=top_k)
-        mask_val = torch.ones(len(idx))
-        mask_idx = flatten.indices()[:,idx]
+        _, indices = torch.topk(flatten, k=top_k)
+        mask = torch.zeros_like(flatten, dtype=prob_mat.dtype)
+        mask[indices] = 1
     else:
         raise NotImplementedError
-    mask = torch.sparse_coo_tensor(torch.cat([mask_idx, M.indices()], dim=1), torch.cat([mask_val, M.values()]), (M.size(0), M.size(1))).coalesce()
-    return mask.to(prob_mat.device)
+    
+    return mask.reshape(M.size()).to(prob_mat.device)
+
+def logits2prob(
+    logits: torch.Tensor,
+    M_type: str,
+    tau: float = 0.5
+):
+    # flatten = logits.view(-1)
+    # if M_type == 'entmax':
+    #     prob_mat = top_k * entmax15(flatten, dim=0)
+    if M_type == 'STE':
+        flatten = logits.reshape(-1)
+        prob_mat = torch.softmax(flatten / tau, dim=0)
+    else:
+        raise NotImplementedError
+    return prob_mat.reshape(logits.size()).to(logits.device)
+
+############### Sparse Matrix #################
 
 def extend_mask_coo(
     M: torch.Tensor,            # COO 
@@ -372,15 +389,15 @@ def symbasis(n: int) -> torch.Tensor:
 
 
 def kron_X_I(X: torch.Tensor, dim):
-    # row_idx = torch.stack([torch.arange(X.size(0)*dim) for _ in range(X.size(1))]).T
-    # col_idx_1 = torch.arange(dim).reshape((dim, 1)) + torch.arange(X.size(1)).reshape((1, X.size(1))) * dim
-    # col_idx = torch.cat([col_idx_1 for _ in range(X.size(0))])
-    # values = torch.cat([X for _ in range(dim)], dim=1).reshape(-1)
-    # indices = torch.stack([row_idx.reshape(-1), col_idx.reshape(-1)])
-    dense = torch.kron(X.contiguous(), torch.eye(dim))
-    sparse = dense.to_sparse_coo()
-    return sparse
-    # return sparse.indices().to(X.device), sparse.values().to(X.device)
+    row_idx = torch.stack([torch.arange(X.size(0)*dim) for _ in range(X.size(1))]).T
+    col_idx_1 = torch.arange(dim).reshape((dim, 1)) + torch.arange(X.size(1)).reshape((1, X.size(1))) * dim
+    col_idx = torch.cat([col_idx_1 for _ in range(X.size(0))])
+    values = torch.cat([X for _ in range(dim)], dim=1).reshape(-1)
+    indices = torch.stack([row_idx.reshape(-1), col_idx.reshape(-1)])
+    # dense = torch.kron(X.contiguous(), torch.eye(dim))
+    # sparse = dense.to_sparse_coo()
+    # return sparse
+    return torch.sparse_coo_tensor(indices, values, (X.size(0)*dim, X.size(1)*dim)).coalesce().to(X.device)
     # return indices.to(X.device), values.to(X.device)
 
 def kron_I_X(X: torch.Tensor, dim):
@@ -394,8 +411,32 @@ def kron_I_X(X: torch.Tensor, dim):
     # return indices.to(X.device), values.to(X.device)
     # return torch.sparse_coo_tensor(indices, values, (X.size(0)*dim, X.size(1)*dim)).coalesce()
 
+def create_mask_COO(
+    prob_mat: torch.Tensor,     # COO
+    top_k   : int,
+    M_type  : str,
+    M       : torch.Tensor,     # COO
+):
+    if top_k <= 0:
+        return M
+    flatten = prob_mat - M * 1e9
+    # if M_type == 'entmax':
+    #     if train:
+    #         mask = flatten
+    #     else:
+    #         _, indices = torch.topk(flatten, k=top_k)
+    #         mask = torch.zeros_like(flatten, dtype=prob_mat.dtype)
+    #         mask[indices] = 1
+    if M_type == 'STE':
+        _, idx = torch.topk(flatten.values(), k=top_k)
+        mask_val = torch.ones(len(idx))
+        mask_idx = flatten.indices()[:,idx]
+    else:
+        raise NotImplementedError
+    mask = torch.sparse_coo_tensor(torch.cat([mask_idx, M.indices()], dim=1), torch.cat([mask_val, M.values()]), (M.size(0), M.size(1))).coalesce()
+    return mask.to(prob_mat.device)
 
-def logits2prob(
+def logits2prob_COO(
     logits: torch.Tensor,
     M_type: str,
     tau: float = 0.5

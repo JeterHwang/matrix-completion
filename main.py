@@ -65,19 +65,15 @@ def main():
 
     device = torch.device(args.device)
     if args.task == 'MC':
-        M = torch.sparse_coo_tensor(
-            torch.tensor([[],[]]), 
-            torch.tensor([]), 
-            (args.n * args.n, args.n * args.n)
-        )
+        M = torch.zeros((args.n, args.n))#.to_sparse_coo()
         if not args.search_P:
             M = create_mask(
-                logits2prob(torch.rand((args.n * args.n)), 'STE'),
+                logits2prob(torch.rand((args.n, args.n)), 'STE'),
                 top_k, 
                 'STE', 
                 M
             )
-            
+            top_k = 0
         DSE_MC(
             top_k,
             args.search_loops,

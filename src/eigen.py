@@ -72,7 +72,6 @@ def lanczos(f, X, e, Z, P, tol=1e-4):
     v = torch.from_numpy(eigenvecs[:, 0]).to(device)
     v = v / (torch.linalg.norm(v) + 1e-18)
     lamb_min = torch.dot(v.detach(), hvp(v.detach(), create_graph=True))
-    print(lamb_min)
     return lamb_min
 
 def lobpcg():

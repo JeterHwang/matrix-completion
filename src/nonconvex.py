@@ -6,7 +6,17 @@ from torch.autograd import grad
 from torch.autograd.functional import hessian
 from torch.func import jacrev
 from torch_sparse import spspmm, spmm, transpose
-from src.utils import incoherence_proj, mag_ang_proj, create_mask, emb2rect, logits2prob, kron_X_I, kron_I_X
+from src.utils import (
+    incoherence_proj, 
+    mag_ang_proj, 
+    create_mask,
+    create_mask_COO, 
+    logits2prob, 
+    logits2prob_COO,
+    emb2rect, 
+    kron_X_I, 
+    kron_I_X,
+)
 import time
 
 def create_loss_fn(loss_type, **kwargs):
@@ -63,15 +73,19 @@ def create_loss_fn(loss_type, **kwargs):
         P       : torch.Tensor  = _P,
         top_k   : int           = _top_k,   # Not optimized
         M_type  : str           = _M_type,  # Not optimized
-        M       : torch.Tensor  = _M.to_dense(),       # default mask (COO format)
-        Ps      : torch.Tensor  = _sym,     # phi_n @ phi_n.T (COO format)
+        M       : torch.Tensor  = _M,       # default mask (COO format)
         tau     : float         = 1,
-        diff    : bool          = _diff,
     ):
-        n, r = X.size()
+        P_train = P.requires_grad
+        if P_train:
+            prob_mat = logits2prob(P, M_type, tau)          # Sparse COO
+            mask = create_mask(prob_mat, top_k, M_type, _M)  # Sparse COO
+            mask = (mask - prob_mat).detach() + prob_mat
+        else:
+            mask = M
         sq = X @ X.T - Z @ Z.T
         res = sq + e
-        Ar = M @ res.reshape(n*n, -1)
+        Ar = mask * res
         loss = Ar.square().sum() / 4
         return loss
 
@@ -103,8 +117,8 @@ def create_loss_fn(loss_type, **kwargs):
         # print("hessian by Pytorch: ", hessian_X)
         P_train = P.requires_grad
         if P_train:
-            prob_mat = logits2prob(P, M_type, tau)          # Sparse COO
-            mask = create_mask(prob_mat, top_k, M_type, _M)  # Sparse COO
+            prob_mat = logits2prob_COO(P, M_type, tau)          # Sparse COO
+            mask = create_mask_COO(prob_mat, top_k, M_type, _M)  # Sparse COO
             mask = (mask - prob_mat).detach() + prob_mat
             Ps_AT = torch.sparse.mm(Ps, mask.T)
         else:
@@ -134,13 +148,12 @@ def create_loss_fn(loss_type, **kwargs):
         else:
             XT_I = kron_X_I(X.T, n)  
             JxT_AT = 2 * torch.sparse.mm(XT_I, _Ps_AT)
-            gradient = 0.5 * torch.sparse.mm(JxT_AT, Ar)
-            # ATAr = torch.sparse.mm(M.T, Ar)
-            # Ps_ATAr = torch.sparse.mm(Ps, ATAr)
-            # gradient = torch.sparse.mm(XT_I, Ps_ATAr)
+            AT_idx, AT_val = transpose(M.indices(), M.values(), n*n, n*n)
+            ATAr = spmm(AT_idx, AT_val, n*n, n*n, Ar)
+            Ps_ATAr = spmm(Ps.indices(), Ps.values(), n*n, n*n, ATAr)
+            gradient = spmm(XT_I.indices(), XT_I.values(), XT_I.size(0), XT_I.size(1), Ps_ATAr)
             # print(JxT_AT.to_dense(), Ar.to_dense())
             time1 = time.time()
-             
             # gradient = 0.5 * torch.sparse.mm(JxT_AT, Ar) # Dense
             # print(gradient)
             # sym_Ar = torch.sparse.mm(Ps_AT, Ar).reshape(n, n)# Dense
@@ -157,7 +170,7 @@ def create_loss_fn(loss_type, **kwargs):
             hess_dense = hess.to_dense()
             time7 = time.time()
             # print("second:")
-            # print(time2 - time1, time3 - time2, time4 - time3, time5 - time4, time6 - time5, time7 - time6)
+            print(time2 - time1, time3 - time2, time4 - time3, time5 - time4, time6 - time5, time7 - time6)
             
             return loss, sq_loss, gradient, hess_dense
 
@@ -312,8 +325,10 @@ def create_loss_fn(loss_type, **kwargs):
 
     if loss_type == 'MC':
         return MC_loss_fn
-    elif loss_type == 'MC_PSD':
+    elif loss_type == 'MC_PSD_sparse':
         return MC_loss_fn_PSD_2
+    elif loss_type == 'MC_PSD_dense':
+        return MC_loss_fn_PSD_dense
     elif loss_type == 'PSSE':
         return PSSE_loss_fn
     else:
