@@ -27,7 +27,6 @@ def create_loss_fn(loss_type, **kwargs):
     _sym    = kwargs['sym'] if 'sym' in kwargs else 0
     _Ps_AT  = kwargs['Ps_AT'] if 'Ps_AT' in kwargs else 0
     _diff   = kwargs['diff'] if 'diff' in kwargs else False
-    
     # if _A is not None: # PSSE
     #     MA_idx, MA_val = spspmm(_M.indices(), _M.values(), _A.indices(), _A.values(), _M.size(0), _M.size(1), _A.size(1)) # torch.sparse.mm(_M, _A)
     #     MAT_idx, MAT_val = transpose(MA_idx, MA_val, _M.size(0), _A.size(1))
@@ -57,6 +56,111 @@ def create_loss_fn(loss_type, **kwargs):
         return torch.square(P * (XL @ XR.T - ZL @ ZR.T + e)).sum() / 4
         # return torch.square(((mask - prob_mat).detach() + prob_mat) * (XL @ XR.T - ZL @ ZR.T + e)).sum() / 4
     
+    def MC_loss_fn_PSD_dense(
+        X       : torch.Tensor, 
+        e       : torch.Tensor  = _e, 
+        Z       : torch.Tensor  = _Z,
+        P       : torch.Tensor  = _P,
+        top_k   : int           = _top_k,   # Not optimized
+        M_type  : str           = _M_type,  # Not optimized
+        M       : torch.Tensor  = _M.to_dense(),       # default mask (COO format)
+        Ps      : torch.Tensor  = _sym,     # phi_n @ phi_n.T (COO format)
+        tau     : float         = 1,
+        diff    : bool          = _diff,
+    ):
+        n, r = X.size()
+        sq = X @ X.T - Z @ Z.T
+        res = sq + e
+        Ar = M @ res.reshape(n*n, -1)
+        loss = Ar.square().sum() / 4
+        return loss
+
+    def MC_loss_fn_PSD_2(
+        X       : torch.Tensor, 
+        e       : torch.Tensor  = _e, 
+        Z       : torch.Tensor  = _Z,
+        P       : torch.Tensor  = _P,
+        top_k   : int           = _top_k,   # Not optimized
+        M_type  : str           = _M_type,  # Not optimized
+        M       : torch.Tensor  = _M,       # default mask (COO format)
+        Ps      : torch.Tensor  = _sym,     # phi_n @ phi_n.T (COO format)
+        tau     : float         = 1,
+        diff    : bool          = _diff,
+    ):
+        n, r = X.size()
+        # X = X.contiguous()
+        # Z = Z.contiguous()
+        # print(X)
+        # M_dense = M.to_dense()
+        # def testing(a, b, c, d):
+        #     rr = (a @ a.T - c @ c.T + b).reshape((n*n, 1))
+        #     masked = M_dense @ rr
+        #     return masked.square().sum() / 4
+        # print("Loss by PyTorch:", testing(X, e, Z, P))
+        # hessian_X = jacrev(jacrev(testing, argnums=0), argnums=0)(X, e, Z, P).reshape(n,r,-1).reshape(n*r,-1)
+        # grad_X = jacrev(testing, argnums=0)(X, e, Z, P)
+        # print("grad by Pytorch: ", grad_X)
+        # print("hessian by Pytorch: ", hessian_X)
+        P_train = P.requires_grad
+        if P_train:
+            prob_mat = logits2prob(P, M_type, tau)          # Sparse COO
+            mask = create_mask(prob_mat, top_k, M_type, _M)  # Sparse COO
+            mask = (mask - prob_mat).detach() + prob_mat
+            Ps_AT = torch.sparse.mm(Ps, mask.T)
+        else:
+            M_idx, M_val = M.indices(), M.values()
+            Ps_AT_idx, Ps_AT_val = _Ps_AT.indices(), _Ps_AT.values() 
+        time1 = time.time()
+        sq = X @ X.T - Z @ Z.T
+        res = sq + e
+        time2 = time.time()
+        
+        Ar = torch.sparse.mm(M, res.reshape((n*n, 1)))  # Sparse @ Dense = Dense
+        # Ps_AT = torch.sparse.mm(Ps, M.T)                # Sparse
+        # JxT_AT = 2 * torch.sparse.mm(XT_I, Ps_AT) 
+        # JxT_AT = torch.sparse_coo_tensor(JxT_AT_idx, JxT_AT_val * 2, (n*r, n*n)).coalesce()
+        # print(time2 - time1, time3 - time2, time4 - time3, time5 - time4, time6 - time5)    
+        # JxT = torch.sparse.mm(XT_I, Ps)
+        ################## TODO ##################
+        ### 1. Coalesce
+        ### 2. Optimize Kronecker
+        ### 3. Switch spspmm to torch_sparse
+        ##########################################
+        loss = Ar.square().sum() / 4
+        sq_loss = torch.linalg.matrix_norm(sq, ord='fro')
+
+        if not diff:
+            return loss, sq_loss
+        else:
+            XT_I = kron_X_I(X.T, n)  
+            JxT_AT = 2 * torch.sparse.mm(XT_I, _Ps_AT)
+            gradient = 0.5 * torch.sparse.mm(JxT_AT, Ar)
+            # ATAr = torch.sparse.mm(M.T, Ar)
+            # Ps_ATAr = torch.sparse.mm(Ps, ATAr)
+            # gradient = torch.sparse.mm(XT_I, Ps_ATAr)
+            # print(JxT_AT.to_dense(), Ar.to_dense())
+            time1 = time.time()
+             
+            # gradient = 0.5 * torch.sparse.mm(JxT_AT, Ar) # Dense
+            # print(gradient)
+            # sym_Ar = torch.sparse.mm(Ps_AT, Ar).reshape(n, n)# Dense
+            time2 = time.time()
+            sym_Ar = torch.sparse.mm(_Ps_AT, Ar).reshape(n, n)
+            # print(JxT_AT)
+            time3 = time.time()
+            curv = kron_I_X(sym_Ar, r)                  # Sparse
+            time4 = time.time()
+            GN = 0.5 * torch.sparse.mm(JxT_AT, JxT_AT.T)
+            time5 = time.time()
+            hess = (GN + curv).coalesce()
+            time6 = time.time()
+            hess_dense = hess.to_dense()
+            time7 = time.time()
+            # print("second:")
+            # print(time2 - time1, time3 - time2, time4 - time3, time5 - time4, time6 - time5, time7 - time6)
+            
+            return loss, sq_loss, gradient, hess_dense
+
     def MC_loss_fn_PSD(
         X       : torch.Tensor, 
         e       : torch.Tensor  = _e, 
@@ -209,7 +313,7 @@ def create_loss_fn(loss_type, **kwargs):
     if loss_type == 'MC':
         return MC_loss_fn
     elif loss_type == 'MC_PSD':
-        return MC_loss_fn_PSD
+        return MC_loss_fn_PSD_2
     elif loss_type == 'PSSE':
         return PSSE_loss_fn
     else:

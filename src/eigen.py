@@ -72,6 +72,7 @@ def lanczos(f, X, e, Z, P, tol=1e-4):
     v = torch.from_numpy(eigenvecs[:, 0]).to(device)
     v = v / (torch.linalg.norm(v) + 1e-18)
     lamb_min = torch.dot(v.detach(), hvp(v.detach(), create_graph=True))
+    print(lamb_min)
     return lamb_min
 
 def lobpcg():
@@ -81,7 +82,7 @@ def eigen_decomp(f, X, e, Z, P):
     w, h = X.size()
     time1 = time.time()
     # hessian_X = hessian(f, (X, e, Z, P), create_graph=False)[0][0].reshape(w,h,-1).reshape(w*h,-1)
-    hessian_X = jacrev(jacrev(f, argnums=0, has_aux=True), argnums=0, has_aux=True)(X, e, Z, P).reshape(w,h,-1).reshape(w*h,-1)
+    hessian_X = jacrev(jacrev(f, argnums=0), argnums=0)(X, e, Z, P).reshape(w,h,-1).reshape(w*h,-1)
     print(hessian_X)
     time2 = time.time()
     hvp = build_hvp_operator(f, X, e, Z, P)
@@ -91,8 +92,9 @@ def eigen_decomp(f, X, e, Z, P):
     v = eigenvectors[0] / (torch.linalg.norm(eigenvectors[0]) + 1e-18)
     lamb_min = torch.dot(v.detach(), hvp(v.detach(), create_graph=True))
     time5 = time.time()
-    print(f"Compute hessian : {time2 - time1} (s)")
-    print(f"build hvp operator: {time3 - time2} (s)")
-    print(f"Eigen Decomposition: {time4 - time3} (s)")
-    print(f"Compute lambda min: {time5 - time4} (s)")
-    # return lamb_min
+    print(lamb_min, eigenvalues[0])
+    # print(f"Compute hessian : {time2 - time1} (s)")
+    # print(f"build hvp operator: {time3 - time2} (s)")
+    # print(f"Eigen Decomposition: {time4 - time3} (s)")
+    # print(f"Compute lambda min: {time5 - time4} (s)")
+    return eigenvalues[0]

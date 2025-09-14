@@ -97,7 +97,10 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
         time1 = time.time()
         f_Z, _ = f(Z, e, Z, P, tau=tau, diff=False)
         f_X, sq_loss, grad_X, hess_X = f(X, e, Z, P, tau=tau, diff=True)
-        # f_X, sq_loss = f(X, e, Z, P, tau=tau, diff=False)
+        # print(grad_X)
+        # print(hess_X)
+        # f_Z = f(Z, e, Z, P, tau=tau, diff=False)
+        # f_X = f(X, e, Z, P, tau=tau, diff=False)
         transform_loss = -sq_loss
         time2 = time.time()
         # print("gradient closed form: ", grad_X)
@@ -108,14 +111,16 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
         # hessians = hessian(f, (X, e, Z, P), create_graph=True)
         # hessian_X = hessians[0][0].reshape(w,h,-1).reshape(w*h,-1)
         # hessian_X = (hessian_X + hessian_X.T) / 2
+        
         first_order_loss_X = torch.linalg.norm(grad_X)
         # grad_X = grad(f(X, e, Z, P), X, create_graph=True)
+        # print(grad_X)
         # first_order_loss_X = torch.linalg.norm(grad_X[0])
-        # second_order_loss_X = -torch.linalg.eigvalsh(hessian_X)[0]
+        
         time3 = time.time()
         eigvals = eigvalsh(hess_X)
         second_order_loss_X = -eigvals[0]
-        # second_order_loss_X = -lanczos(f, X, e, Z, P, tol=1e-4)
+        # second_order_loss_X = -lanczos(f, X, e, Z, P)
         time4 = time.time()
         # eigen_decomp(f, X, e, Z, P) # torch.tensor([0.0], dtype=torch.float64) #
         # print(second_order_loss_X)
@@ -125,9 +130,10 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
         # print(f"Compute loss, grad, hess: {time2 - time1} (s)")
         # print(f"Compute norm: {time3 - time2} (s)")
         # print(f"Compute eigen decomposition: {time4 - time3}")
+        # print(first_order_loss_X, second_order_loss_X)
         max_loss = torch.maximum(first_order_loss_X, second_order_loss_X)
         return (
-            alpha * transform_loss + beta * max_loss, 
+            max_loss, 
             diff_loss, 
             first_order_loss_X, 
             second_order_loss_X, 
@@ -255,6 +261,7 @@ def search(
             # beta = coeff.detach()[1]
             time1 = time.time()
             loss, diff, grad_X, hess_X, f_X, f_Z, trans, max_loss = criterion(**parameters, alpha=alpha, beta=beta, tau=tau)
+            # print(f"Max Loss = {loss}")
             # print(parameters, f_X.item(), f_Z.item(), trans.item(), grad_X.item(), hess_X.item(), max_loss.item())
             time2 = time.time()
             inputs = [parameters['X'], parameters['Z']] if 'Z' in parameters else [parameters['X']]
@@ -263,6 +270,8 @@ def search(
             optimizer_W.zero_grad()
             time3 = time.time()
             loss.backward()
+            # print(parameter_groups[0]['params'][0].grad)
+            # print(parameter_groups[1]['params'][0].grad)
             time4 = time.time()
             # print(f"forward pass: {time2 - time1} (s)")
             # print(f"Compute gradients: {time3 - time2} (s)")

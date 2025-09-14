@@ -372,26 +372,26 @@ def symbasis(n: int) -> torch.Tensor:
 
 
 def kron_X_I(X: torch.Tensor, dim):
-    row_idx = torch.stack([torch.arange(X.size(0)*dim) for _ in range(X.size(1))]).T
-    col_idx_1 = torch.arange(dim).reshape((dim, 1)) + torch.arange(X.size(1)).reshape((1, X.size(1))) * dim
-    col_idx = torch.cat([col_idx_1 for _ in range(X.size(0))])
-    values = torch.cat([X for _ in range(dim)], dim=1).reshape(-1)
-    indices = torch.stack([row_idx.reshape(-1), col_idx.reshape(-1)])
-    # print(indices, values)
-    # dense = torch.kron(X.contiguous(), torch.eye(dim))
-    # return dense.to_sparse_coo()
-    return indices.to(X.device), values.to(X.device)
-    # return torch.sparse_coo_tensor(indices, values, (X.size(0)*dim, X.size(1)*dim)).coalesce()
+    # row_idx = torch.stack([torch.arange(X.size(0)*dim) for _ in range(X.size(1))]).T
+    # col_idx_1 = torch.arange(dim).reshape((dim, 1)) + torch.arange(X.size(1)).reshape((1, X.size(1))) * dim
+    # col_idx = torch.cat([col_idx_1 for _ in range(X.size(0))])
+    # values = torch.cat([X for _ in range(dim)], dim=1).reshape(-1)
+    # indices = torch.stack([row_idx.reshape(-1), col_idx.reshape(-1)])
+    dense = torch.kron(X.contiguous(), torch.eye(dim))
+    sparse = dense.to_sparse_coo()
+    return sparse
+    # return sparse.indices().to(X.device), sparse.values().to(X.device)
+    # return indices.to(X.device), values.to(X.device)
 
 def kron_I_X(X: torch.Tensor, dim):
-    row_idx = torch.stack([torch.arange(X.size(0) * dim) for _ in range(X.size(1))]).T
-    col_idx_1 = torch.cat([torch.arange(X.size(1)) for _ in range(X.size(0))])
-    col_idx = torch.arange(dim).reshape((dim, 1)) * X.size(1) + col_idx_1.reshape((1, -1)) 
-    values = torch.cat([X for _ in range(dim)], dim=0).reshape(-1)
-    indices = torch.stack([row_idx.reshape(-1), col_idx.reshape(-1)])
-    # dense = torch.kron(torch.eye(dim), X.contiguous())
-    # return dense.to_sparse_coo()
-    return indices.to(X.device), values.to(X.device)
+    # row_idx = torch.stack([torch.arange(X.size(0) * dim) for _ in range(X.size(1))]).T
+    # col_idx_1 = torch.cat([torch.arange(X.size(1)) for _ in range(X.size(0))])
+    # col_idx = torch.arange(dim).reshape((dim, 1)) * X.size(1) + col_idx_1.reshape((1, -1)) 
+    # values = torch.cat([X for _ in range(dim)], dim=0).reshape(-1)
+    # indices = torch.stack([row_idx.reshape(-1), col_idx.reshape(-1)])
+    dense = torch.kron(torch.eye(dim), X.contiguous())
+    return dense.to_sparse_coo()
+    # return indices.to(X.device), values.to(X.device)
     # return torch.sparse_coo_tensor(indices, values, (X.size(0)*dim, X.size(1)*dim)).coalesce()
 
 
