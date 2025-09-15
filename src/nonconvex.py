@@ -265,13 +265,13 @@ def create_loss_fn(loss_type, **kwargs):
         # return torch.square(((mask - prob_mat).detach() + prob_mat) * (X @ X.T - Z @ Z.T + e)).sum() / 4
     
     def PSSE_loss_fn(
-        X_emb   : torch.Tensor, 
+        X       : torch.Tensor, 
         e       : torch.Tensor  = _e, 
-        Z_emb   : torch.Tensor  = _Z,
+        Z       : torch.Tensor  = _Z,
         P       : torch.Tensor  = _P,
         A       : torch.Tensor  = _A,       # measurement matrix (COO format)
-        Ps      : torch.Tensor  = _sym,     # phi_n @ phi_n.T (COO format)
         top_k   : int           = _top_k,   # Not optimized
+        is_rect : bool          = _is_rect,
         M_type  : str           = _M_type,  # Not optimized
         M       : torch.Tensor  = _M,       # default mask (COO format)
         Vmin    : float         = _Vmin,    # Not optimized
@@ -279,50 +279,31 @@ def create_loss_fn(loss_type, **kwargs):
         thmin   : float         = _thmin,   # Not optimized
         thmax   : float         = _thmax,   # Not optimized 
         tau     : float         = 1,
-        diff    : bool          = _diff,
     ):
-        n, r = X.size()
-        d = A.size(0)
-        X = emb2rect(X_emb, Vmin, Vmax, thmin, thmax)
-        Z = emb2rect(Z_emb, Vmin, Vmax, thmin, thmax)
-        
         P_train = P.requires_grad
+        if is_rect:
+            X_rect = X
+            Z_rect = Z
+        else:
+            X_rect = emb2rect(X, Vmin, Vmax, thmin, thmax)
+            Z_rect = emb2rect(Z, Vmin, Vmax, thmin, thmax)
+        # print("X_rect = ", X_rect)
+        # print("X_rect = ", Z_rect)
+        r = X_rect @ X_rect.T - Z_rect @ Z_rect.T + e
+        Ar = torch.sparse.mm(A, r.reshape(-1, 1)).squeeze()
+        # pred = (X_rect.T.unsqueeze(0) @ A @ X_rect.unsqueeze(0)).squeeze()
+        # gt = (Z_rect.T.unsqueeze(0) @ A @ Z_rect.unsqueeze(0)).squeeze()
         if P_train:
-            prob_mat = logits2prob(P, M_type, tau)          # Sparse COO
-            mask = create_mask(prob_mat, top_k, M_type, _M)  # Sparse COO
+            prob_mat = logits2prob(P, M_type, tau)
+            mask = create_mask(prob_mat, top_k, M_type, M)
             mask = (mask - prob_mat).detach() + prob_mat
-            M_idx, M_val = mask.indices(), mask.values()
-            A_idx, A_val = spspmm(M_idx, M_val, A.indices(), A.values(), d, d, n*n)
-            AT_idx, AT_val = transpose(A_idx, A_val, d, n*n)
-            Ps_AT_idx, Ps_AT_val = spspmm(Ps.indices(), Ps.values(), AT_idx, AT_val, n*n, n*n, d)
         else:
-            A_idx, A_val = MA.indices(), MA.values()
-            Ps_AT_idx, Ps_AT_val = Ps_AT.indices(), Ps_AT.values()
+            mask = M
+        # r = pred - gt + e
+        # print("r = ", r)
+        masked =  mask * Ar
+        return masked.square().sum() / 2
         
-        sq = X @ X.T - Z @ Z.T
-        res = sq + e
-        Ar = spmm(A_idx, A_val, d, n*n, res.reshape((n*n, 1)))
-        loss = Ar.square().sum() / 4
-        sq_loss = torch.linalg.matrix_norm(sq, ord='fro')
-
-        if not diff:
-            return loss, sq_loss
-        else:
-            XT_I_idx, XT_I_val = kron_X_I(X.T, n)  
-            JxT_AT_idx, JxT_AT_val = spspmm(XT_I_idx, XT_I_val, Ps_AT_idx, Ps_AT_val, n*r, n*n, d)
-            JxT_AT_val = JxT_AT_val * 2 
-            gradient = 0.5 * spmm(JxT_AT_idx, JxT_AT_val, n*r, d, Ar)# Dense
-            sym_Ar = spmm(Ps_AT_idx, Ps_AT_val, n*n, d, Ar).reshape(n, n)
-            curv_idx, curv_val = kron_I_X(sym_Ar, r)                  # Sparse
-            curv = torch.sparse_coo_tensor(curv_idx, curv_val, (n*r, n*r))
-            
-            A_Jx_idx, A_Jx_val = transpose(JxT_AT_idx, JxT_AT_val, n*r, d)
-            GN_idx, GN_val = spspmm(JxT_AT_idx, JxT_AT_val, A_Jx_idx, A_Jx_val, n*r, d, n*r)
-            GN = torch.sparse_coo_tensor(GN_idx, GN_val * 0.5, (n*r, n*r))
-            hess = (GN + curv).coalesce()
-            hess_dense = hess.to_dense()
-            return loss, sq_loss, gradient, hess_dense
-
     if loss_type == 'MC':
         return MC_loss_fn
     elif loss_type == 'MC_PSD_sparse':
@@ -379,14 +360,14 @@ def sgd(
             if optim == 'L-BFGS':
                 def closure():
                     optimizer.zero_grad()
-                    loss, _ = criterion(**parameters)
+                    loss = criterion(**parameters)
                     loss.backward()
                     return loss
                 loss = optimizer.step(closure)
                 losses.append((loss.item()))
             else:
                 optimizer.zero_grad()
-                loss, _ = criterion(**parameters)
+                loss = criterion(**parameters)
                 losses.append((loss.item()))
                 loss.backward()
                 optimizer.step()

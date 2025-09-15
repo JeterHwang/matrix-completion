@@ -6,6 +6,7 @@ from pathlib import Path
 from torch.autograd import grad
 from torch.autograd.functional import hessian
 from typing import List, Dict
+from src.eigen import lanczos
 from src.convex import SDP
 from src.nonconvex import sgd, create_loss_fn, create_proj_fn
 from src.utils import spectral_initialization, logits2prob, create_mask, emb2rect, symbasis
@@ -179,48 +180,89 @@ def check_random_MC(
     return categories
 
 def check_PSSE(
-    counter_X: torch.Tensor,
-    Z: torch.Tensor,
-    loss_fn,
-    proj_fn,
-    constraints
+    parameters: Dict[str, torch.Tensor],
+    A           : torch.Tensor,
+    top_k       : int, 
+    verbose     : bool          = False,
+    M           : torch.Tensor  = None,
+    M_type      : str           = 'STE',
+    constraints : tuple         = (0.3, 1, -torch.pi/2, torch.pi/2),
+    save_path   : Path          = None
 ):
-    parameters = {'X': counter_X}
-    losses, _, _ = sgd(
-        parameters, 
+    X = parameters['X']
+    Z = parameters['Z']
+    e = parameters['e']
+    P = parameters['P'] if 'P' in parameters else torch.zeros_like(e)
+    prob_mat = logits2prob(P, M_type)
+    mask = create_mask(prob_mat, top_k, M_type, M)
+
+    sgd_parameters = {'X': X}
+    loss_fn = create_loss_fn(
+        'PSSE', 
+        P       = P.detach(),
+        Z       = Z.detach(), 
+        top_k   = top_k,
+        A       = A,
+        is_rect = False,
+        Vmin    = constraints[0],
+        Vmax    = constraints[1],
+        thmin   = constraints[2],
+        thmax   = constraints[3],
+        M       = mask.detach(),
+        M_type  = M_type
+    )
+    proj_fn = create_proj_fn('PSSE')
+    losses = sgd(
+        sgd_parameters, 
         loss_fn,
         proj_fn,
         optim       = 'L-BFGS', 
-        iters       = 5000, 
+        iters       = 2000, 
         lr          = 1e-2,
         min_lr      = 1e-6,
         lr_sched    = 'cosine',
         ret_eig     = False
     )
-    X_rect = emb2rect(parameters['X'], *constraints)
+    counter_X = sgd_parameters['X']
+    counter_X_rect = emb2rect(counter_X, *constraints)
     Z_rect = emb2rect(Z, *constraints)
-    error_norm = torch.linalg.norm(X_rect - Z_rect, ord='fro')
     orig = copy.deepcopy(loss_fn.__defaults__)
-    loss_fn.__defaults__ = orig[:1] + (Z_rect,) + orig[2:5] + (True,) + loss_fn.__defaults__[6:]
-    grad_norm = torch.linalg.matrix_norm(grad(loss_fn(X=X_rect), X_rect)[0]).item()
-    min_eig = torch.linalg.eigvalsh(hessian(loss_fn, (X_rect)).reshape(X_rect.size(0), X_rect.size(1), -1).reshape(X_rect.size(0) * X_rect.size(1), -1))[0].item()
+    loss_fn.__defaults__ = orig[:1] + (Z_rect,) + orig[2:5] + (True,) + orig[6:]
+    
+    grad_norm = torch.linalg.matrix_norm(grad(loss_fn(X=counter_X_rect), counter_X_rect)[0]).item()
+    min_eig = lanczos(loss_fn, counter_X_rect, e, Z_rect, P).item()
+    error_norm = torch.linalg.norm(counter_X_rect - Z_rect, ord='fro')
+    
     loss_fn.__defaults__ = orig
+    if verbose:
+        logging.info(f"Gradient Norm of X_t = {grad_norm}")
+        logging.info(f"|X_t - Z|_F = {error_norm}")
+        logging.info(f"f(X_t) = {losses[-1]}")
+        logging.info(f"\lamb_min(hess(X_t)) = {min_eig}")
     if error_norm > 1e-2 and grad_norm < 1e-2:
-        logging.info(f"Gradient Norm of X_t = {grad_norm}")
-        logging.info(f"|X_t - Z|_F = {error_norm}")
-        logging.info(f"f(X_t) = {losses[-1]}")
-        logging.info(f"\lamb_min(hess(X_t)) = {min_eig}")
         logging.info("SUCCEED :)")
-        return True
+        np.save(
+            save_path,
+            {
+                'counter': counter_X_rect.detach().numpy(),
+                'Z': Z_rect.detach().numpy(),
+                'M': mask.detach().numpy()
+            }
+        )
+        categories = check_random_PSSE(
+            50,
+            counter_X,
+            Z,
+            loss_fn,
+            proj_fn,
+            constraints
+        )
+        return True, categories
     else:
-        logging.info(f"Gradient Norm of X_t = {grad_norm}")
-        logging.info(f"|X_t - Z|_F = {error_norm}")
-        logging.info(f"f(X_t) = {losses[-1]}")
-        logging.info(f"\lamb_min(hess(X_t)) = {min_eig}")
         logging.info("FAILED :(")
-        return False
+        return False, {}
 
-def check_random(
+def check_random_PSSE(
     iters: int,
     X: torch.Tensor,
     Z: torch.Tensor,

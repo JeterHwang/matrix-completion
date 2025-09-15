@@ -203,14 +203,16 @@ def load_mat_data(path):
     # Make sure A is the actual sparse matrix (not wrapped in a 1×1 object array)
     if isinstance(A, np.ndarray) and A.dtype == object:
         A = A.item()                # unwrap cell / struct entry:contentReference[oaicite:1]{index=1}
+    
+    values = A.data
+    indices = np.vstack((A.row, A.col))
+    matrix_shape = A.shape
 
-    # Put A in the format you like:
-    A = A.tocsr()                   # fast mat-vecs; or .tocsc(), .toarray(), …
+    torch_values = torch.FloatTensor(values)
+    torch_indices = torch.LongTensor(indices)
+    torch_shape = torch.Size(matrix_shape)
 
-    # If you really need dense NumPy arrays:
-    A_dense = A.toarray()           # beware of memory blow-up for large matrices
-
-    return A_dense
+    return torch.sparse_coo_tensor(torch_indices, torch_values, torch_shape).T.coalesce()
 
 def create_P(mats):
     P = []

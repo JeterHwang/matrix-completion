@@ -12,7 +12,7 @@ parser = argparse.ArgumentParser(description="Flower Embedded devices")
 parser.add_argument("--task",           type=str,   default="MC",       help="Which task", choices=["MC", "PSSE"], )
 parser.add_argument("--search_P",       type=bool,  default=False,      help="")
 
-parser.add_argument("--busses",         type=int,   default=2,          help="bus measurement matrix to load", choices=["2"])
+parser.add_argument("--busses",         type=int,   default=2,          help="bus measurement matrix to load", choices=[2, 14, 39, 118, 300])
 parser.add_argument("--Vmax",           type=float, default=1.3,        help="")
 parser.add_argument("--Vmin",           type=float, default=0.7,        help="")
 parser.add_argument("--thmin",          type=float, default=-np.pi/2,   help="")
@@ -57,14 +57,15 @@ def main():
     for arg, val in sorted(vars(args).items()):
         logging.info(f"{arg:<15} : {val}")
     logging.info("*****************************************")
-    # Address top-k
-    if args.top_k is None:
-        top_k = int(args.n * args.n * args.sample_prob)
-    else:
-        top_k = args.top_k
 
     device = torch.device(args.device)
     if args.task == 'MC':
+        # Top-k
+        if args.top_k is None:
+            top_k = int(args.n * args.n * args.sample_prob)
+        else:
+            top_k = args.top_k
+        # Default Mask
         M = torch.zeros((args.n, args.n))#.to_sparse_coo()
         if not args.search_P:
             M = create_mask(
@@ -95,20 +96,22 @@ def main():
             result_path,
         )
     else:
-        if args.busses == 2:
-            A_np = load_mat_data("data/2bus/2bus_data.mat")
-            n = 2 * args.busses - 1
-            A = torch.tensor(np.moveaxis(A_np.reshape(n,n,10), -1, 0)).reshape((10, -1)).to_sparse_coo()
+        # A matrix
+        A_COO = load_mat_data(f"data/2+bus/case{args.busses}.mat")
+        n = 2 * args.busses - 1
+        # print(A_COO.size(), len(A_COO.values()))
+        # Top-k
+        if args.top_k is None:
+            top_k = n
         else:
-            raise NotImplementedError
-        d = A.size(0)
+            top_k = args.top_k
+        d = A_COO.size(0)
         assert d > n and top_k >= n
+        # Default mask
         # Always pick the first n power flow measurements
-        M = torch.sparse_coo_tensor(
-            torch.stack([torch.arange(n), torch.arange(n)], dim=0),
-            torch.ones(n), 
-            (d, d)
-        )
+        M = torch.zeros(d)
+        M[:n] = 1
+        top_k -= n
         if not args.search_P:
             M = create_mask(
                 logits2prob(torch.rand((d)), 'STE'),
@@ -116,11 +119,13 @@ def main():
                 'STE', 
                 M
             )
+            top_k = 0
         DSE_PSSE(
             top_k,
             args.search_loops,
+            device,
             args.e_norm,
-            A,
+            A_COO,
             f"{args.task}_{args.loss_type}",
             args.optimizer,
             args.iters,
@@ -129,7 +134,10 @@ def main():
             args.lr_sched,
             args.temperature,
             (args.max_sq_loss, args.min_sq_loss),
-            (args.Vmin, )
+            (args.Vmin, args.Vmax, args.thmin, args.thmax),
+            args.M_type,
+            M,
+            result_path,
         )
 
 

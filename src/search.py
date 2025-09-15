@@ -18,8 +18,8 @@ from src.utils import (
 )
 from src.eigen import lanczos, power_method, eigen_decomp
 from src.nonconvex import create_loss_fn
-from src.verify import check_MC
-from src.plot import plot_loss
+from src.verify import check_MC, check_PSSE
+from src.plot import plot_loss, plot_contour
 
 def create_search_proj_fn(proj_type, **kwargs):
     @torch.no_grad()
@@ -94,6 +94,7 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
     ): 
         assert X.size() == Z.size()
         w, h = X.size()
+        f.__defaults__ = f.__defaults__[:-1] + (tau,)
         time1 = time.time()
         # f_Z, _ = f(Z, e, Z, P, tau=tau, diff=False)
         # f_X, sq_loss, grad_X, hess_X = f(X, e, Z, P, tau=tau, diff=True)
@@ -179,13 +180,21 @@ def create_search_loss_fn(f, loss_type='MC_sum', **kwargs): # Use MC-PSD-2
             thmax   : float         = _thmax,   # Not optimized
         ): # Use PSSE-1
         #################
-        f_X, sq_loss, grad_X, hess_X = f(X, e, Z, P, tau=tau, Vmin=Vmin, Vmax=Vmax, thmin=thmin, thmax=thmax, diff=True)
-        f_Z, _ = f(Z, e, Z, P, tau=tau, Vmin=Vmin, Vmax=Vmax, thmin=thmin, thmax=thmax, diff=False)
+        f.__defaults__ = f.__defaults__[:-1] + (tau,)
+        X_rect = emb2rect(X, Vmin, Vmax, thmin, thmax)
+        Z_rect = emb2rect(Z, Vmin, Vmax, thmin, thmax)
+        w, h = X_rect.size()
+        #################
+        f_X = f(X_rect, e, Z_rect, P)
+        f_Z = f(Z_rect, e, Z_rect, P)
         diff_loss = f_Z - f_X
-        transform_loss = -sq_loss
+        
+        # dist_loss = -torch.linalg.norm(X_rect - Z_rect)
+        ##################
+        grad_X = grad(f(X_rect, e, Z_rect, P), [X_rect], create_graph=True)[0]
         first_order_loss_X = torch.linalg.norm(grad_X)
-        eigvals = eigvalsh(hess_X)
-        second_order_loss_X = -eigvals[0]
+        second_order_loss_X = -lanczos(f, X_rect, e, Z_rect, P)
+        transform_loss = -torch.linalg.matrix_norm(X_rect @ X_rect.T - Z_rect @ Z_rect.T, ord='fro')
         max_loss = torch.maximum(first_order_loss_X, second_order_loss_X)
         return (
             alpha * transform_loss + beta * max_loss, 
@@ -293,7 +302,7 @@ def search(
             # boost = 0.5 * (1 + 3) + 0.5 * (3 - 1) * np.cos(np.pi * i / iters)
             r1 = (trans.item() - trans_0.item()) / (trans_bound[0] - trans_0.item())
             r2 = (max_loss_0.item() - max_loss.item()) / max_loss_0.item() # * boost
-            alpha = grad_norm_2.item() / grad_norm_1.item() * (np.exp(r1 * T) / (np.exp(r1 * T) + np.exp(r2 * T)))
+            alpha = min(grad_norm_2.item() / grad_norm_1.item(), 50) * (np.exp(r1 * T) / (np.exp(r1 * T) + np.exp(r2 * T)))
             beta =  (np.exp(r2 * T) / (np.exp(r1 * T) + np.exp(r2 * T)))
             tau = 0.5 * (0.5 + 0.05) + 0.5 * (0.5 - 0.05) * np.cos(np.pi * i / iters)
             # alpha = 0.01
@@ -432,7 +441,6 @@ def compute_X_Z_e(
 def search_counter(
     variables, 
     top_k, 
-    n,
     e_norm, 
     A,                          # COO format
     loss_type   = 'PSSE_max', 
@@ -444,33 +452,33 @@ def search_counter(
     T           = 1, 
     trans_bound = (-1, -1e-2), 
     constraints = (0.3, 1, -torch.pi/2, torch.pi/2),
-    M_type      = 'STE'
+    M_type      = 'STE',
+    device      = torch.device('cpu'),
 ):
     # x_0 = PSSE_initialization(z, 1.0)
     # x = torch.tensor(np.concatenate([x_0.real, x_0.imag]), requires_grad=True, dtype=torch.float64)
-    d = A.size(0)
+    d, n = A.size(0), int(np.sqrt(A.size(1)))
     parameters = {}
     for name, val  in variables.items():
         if name == 'X':
-            X = torch.normal(0.0, 3.0 * torch.ones((n, 1))).requires_grad_()
+            X = torch.normal(0.0, 2.0 * torch.ones((n, 1))).to(device).requires_grad_()
             parameters['X'] = X
         elif name == 'Z':
             if val is None:
-                Z = torch.normal(0.0, 3.0 * torch.ones((n, 1))).requires_grad_()
+                Z = torch.normal(0.0, 2.0 * torch.ones((n, 1))).to(device).requires_grad_()
                 parameters['Z'] = Z
             else:
-                Z = val
+                Z = val.to(device)
         elif name == 'e':
             if val is None:
-                e = torch.zeros(len(A), requires_grad=True)
+                e = torch.zeros((n, n), requires_grad=True, device=device)
                 parameters['e'] = e
             else:
-                e = val
+                e = val.to(device)
         elif name == 'M':
-            M = val
-        
+            M = val.to(device)
     # check whether we need to train the mask
-    P = torch.rand(d, dtype=torch.float64)
+    P = torch.rand(d, device=device)
     if top_k > 0:
         P.requires_grad_()
         parameters['P'] = P
@@ -484,8 +492,7 @@ def search_counter(
         A       = A,
         M_type  = M_type,
         M       = M.detach(),
-        sym     = symbasis(n),
-        diff    = True
+        is_rect = True,
     )
     criterion = create_search_loss_fn(
         loss_fn, 
@@ -586,6 +593,7 @@ def DSE_MC(
 def DSE_PSSE(
     top_k, 
     search_loops, 
+    device,
     e_norm, 
     A,
     loss_type       = 'PSSE_max', 
@@ -599,9 +607,13 @@ def DSE_PSSE(
     constraints     = (0.3, 1, -torch.pi/2, torch.pi/2),
     M_type          = 'STE',
     M               = None,
-    save_path   = None,
+    save_path       = None,
 ):
-    Pareto = []
+    npy_path = save_path / "npys"
+    fig_path = save_path / "figs"
+    npy_path.mkdir(parents=True, exist_ok=True)
+    fig_path.mkdir(parents=True, exist_ok=True)
+
     for i in range(search_loops):
         logging.info(f"================== Search Iteration : {i} ==================")
         # Search for (X, Z, e)
@@ -611,10 +623,9 @@ def DSE_PSSE(
             "e": None,
             "M": M,
         }
-        _top_k = top_k - len(M.values())
         parameters, losses = search_counter(
             variables,
-            _top_k, 
+            top_k, 
             e_norm, 
             A,
             loss_type, 
@@ -627,49 +638,28 @@ def DSE_PSSE(
             trans_bound,
             constraints,
             M_type,
+            device
         )
+        plot_loss(fig_path / f"iter-{i}.png", losses)
         if len(losses) < iters + 1: # Early Stop
             continue
-        loss_fn = create_loss_fn(
-            'PSSE', 
-            P       = parameters['P'].detach() if 'P' in parameters else M, 
-            Z       = parameters['Z'].detach(), 
-            top_k   = _top_k,
-            A       = A,
-            is_rect = False,
-            Vmin    = constraints[0],
-            Vmax    = constraints[1],
-            thmin   = constraints[2],
-            thmax   = constraints[3],
-            M       = M,
-            M_type  = M_type
-        )
-        proj_fn = create_proj_fn('PSSE')
-        plot_contour(f"search-{i} (before)", parameters['X'].detach(), parameters['Z'].detach(), loss_fn, constraints)
-        flag = check_PSSE(  # fist check
-            parameters['X'], 
-            parameters['Z'],
-            loss_fn,
-            proj_fn,
-            constraints
+        #### Only for 2 busses
+        # plot_contour(
+        #     fig_path / f"iter-{i}-cont", 
+        #     parameters['X'].detach(), 
+        #     parameters['Z'].detach(), 
+        #     loss_fn, 
+        #     constraints
+        # )
+        flag, categories = check_PSSE(  # fist check
+            parameters,
+            A,
+            top_k,
+            verbose     = True,
+            M           = M,
+            M_type      = M_type,
+            constraints = constraints,
+            save_path   = npy_path / f"iter-{i}.npy",
         )
         if flag:  
-            categories = check_random( # double check
-                50,
-                parameters['X'],
-                parameters['Z'],
-                loss_fn,
-                proj_fn,
-                constraints,
-            )
             logging.info(categories)
-            if categories['X'] != 0:
-                logging.info(f"{'=> Total loss':<27} {'=':^1} {losses[-1][0]:>10.2e}")
-                logging.info(f"{'=> f(Z) - f(X)':<27} {'=':^1} {losses[-1][1]:>10.2e}")
-                logging.info(f"{'=> |gradient(X)|':<27} {'=':^1} {losses[-1][2]:>10.2e}")
-                logging.info(f"{'=> -lambda_min(hessian(X))':<27} {'=':^1} {losses[-1][3]:>10.2e}")
-                logging.info(f"{'=> |XX^T-ZZ^T|_F':<27} {'=':^1} {losses[-1][6]:>10.2e}")
-                logging.info(f"{'=> |X-Z|_F':<27} {'=':^1} {torch.linalg.norm(emb2rect(parameters['X'], *constraints) - emb2rect(parameters['Z'], *constraints), ord='fro'):>10.2e}")
-                Pareto.append((categories, copy.deepcopy(parameters)))
-    return Pareto
-    
