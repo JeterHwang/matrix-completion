@@ -489,7 +489,7 @@ def search_counter(
         Z       = Z.detach(), 
         e       = e.detach(),
         top_k   = top_k,
-        A       = A,
+        A       = A.to(device),
         M_type  = M_type,
         M       = M.detach(),
         is_rect = True,
